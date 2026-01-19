@@ -134,6 +134,10 @@ try:
         # Advanced TTS
         XTTSConfig,
         XTTSSynthesizer,
+        # TRUE SOTA TTS
+        StyleTTS2Config,
+        StyleTTS2Synthesizer,
+        StyleTTS2Output,
         # Audio LLM
         AudioLanguageModel,
         # Combined Engine
@@ -231,6 +235,10 @@ __all__ = [
     "AudioSourceSeparator",
     "XTTSConfig",
     "XTTSSynthesizer",
+    # TRUE SOTA TTS
+    "StyleTTS2Config",
+    "StyleTTS2Synthesizer",
+    "StyleTTS2Output",
     "AudioLanguageModel",
     "SOTAAudioEngine",
     # TRUE SOTA additions

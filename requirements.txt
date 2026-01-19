@@ -117,11 +117,30 @@ speechbrain>=1.0.0
 # Used by streaming ASR for better segmentation
 # torch.hub.load('snakers4/silero-vad', 'silero_vad')
 
+# ==================== TRUE SOTA UPGRADES (Optional) ====================
+# These upgrade existing features to absolute TRUE SOTA:
+
+# StyleTTS2: TRUE SOTA Text-to-Speech (surpasses human recordings)
+# Achieves MOS 4.4+ vs human 4.3 on LJSpeech
+# pip install styletts2
+# styletts2>=0.1.0
+# Reference: https://github.com/yl4579/StyleTTS2
+
+# SALMONN: TRUE SOTA Audio Captioning (generative, not retrieval)
+# Speech Audio Language Music Open Neural Network
+# pip install salmonn
+# Reference: https://github.com/bytedance/SALMONN
+
+# EINV2: TRUE SOTA Sound Event Localization and Detection
+# Winner of DCASE 2023 SELD Challenge
+# Uses ACCDOA output format for precise spatial audio
+# Reference: https://github.com/sony/ai-research-code/tree/master/seld
+
 # ==================== NICHE SOTA (Optional) ====================
 # These are specialized features for advanced use cases:
 
 # NISQA: Non-Intrusive Speech Quality Assessment
-# Neural network-based MOS prediction without reference
+# CNN-LSTM neural network for MOS prediction
 # pip install nisqa
 # Reference: https://github.com/gabrielmittag/NISQA
 

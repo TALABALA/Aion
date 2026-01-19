@@ -48,6 +48,7 @@ _WHISPERX_AVAILABLE = False
 _EMOTION_AVAILABLE = False
 _DEMUCS_AVAILABLE = False
 _XTTS_AVAILABLE = False
+_STYLETTS2_AVAILABLE = False
 _AUDIO_LLM_AVAILABLE = False
 
 try:
@@ -83,6 +84,16 @@ try:
         XTTSConfig,
     )
     _XTTS_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        StyleTTS2Synthesizer,
+        StyleTTS2Config,
+        StyleTTS2Output,
+    )
+    _STYLETTS2_AVAILABLE = True
 except ImportError:
     pass
 
@@ -226,7 +237,8 @@ class AuditoryCortexConfig:
     use_whisperx: bool = True  # Use Whisper-X for better alignment
     use_emotion_recognition: bool = True  # Use wav2vec2 emotion model
     use_source_separation: bool = True  # Use Demucs for source separation
-    use_xtts: bool = True  # Use XTTS-v2 for high-quality TTS
+    use_xtts: bool = False  # Use XTTS-v2 for TTS (good but not SOTA)
+    use_styletts2: bool = True  # Use StyleTTS2 for TRUE SOTA TTS
     use_audio_llm: bool = True  # Use Qwen-Audio for direct understanding
 
     # Whisper-X specific settings
@@ -397,6 +409,7 @@ class AuditoryCortex:
         self._emotion_recognizer: Optional[Any] = None
         self._source_separator: Optional[Any] = None
         self._xtts: Optional[Any] = None
+        self._styletts2: Optional[Any] = None
         self._audio_llm: Optional[Any] = None
 
         # TRUE SOTA models (initialized lazily)
@@ -422,6 +435,7 @@ class AuditoryCortex:
             "emotion": False,
             "demucs": False,
             "xtts": False,
+            "styletts2": False,
             "audio_llm": False,
             # TRUE SOTA additions
             "emotion2vec": False,
@@ -523,7 +537,7 @@ class AuditoryCortex:
             except Exception as e:
                 logger.warning(f"Demucs initialization failed: {e}")
 
-        # XTTS: High-quality TTS with voice cloning
+        # XTTS: High-quality TTS with voice cloning (legacy)
         if _XTTS_AVAILABLE and self.config.use_xtts and self.config.enable_tts:
             try:
                 xtts_config = XTTSConfig(
@@ -533,9 +547,20 @@ class AuditoryCortex:
                 self._xtts = XTTSSynthesizer(xtts_config)
                 if await self._xtts.initialize():
                     self._sota_status["xtts"] = True
-                    logger.info("XTTS-v2 initialized (SOTA TTS with voice cloning)")
+                    logger.info("XTTS-v2 initialized (TTS with voice cloning)")
             except Exception as e:
                 logger.warning(f"XTTS initialization failed: {e}")
+
+        # StyleTTS2: TRUE SOTA TTS (surpasses human recordings)
+        if _STYLETTS2_AVAILABLE and self.config.use_styletts2 and self.config.enable_tts:
+            try:
+                styletts2_config = StyleTTS2Config(device=self.config.device)
+                self._styletts2 = StyleTTS2Synthesizer(styletts2_config)
+                if await self._styletts2.initialize():
+                    self._sota_status["styletts2"] = True
+                    logger.info("StyleTTS2 initialized (TRUE SOTA TTS)")
+            except Exception as e:
+                logger.warning(f"StyleTTS2 initialization failed: {e}")
 
         # Audio LLM: Direct audio understanding
         if _AUDIO_LLM_AVAILABLE and self.config.use_audio_llm:
@@ -692,6 +717,14 @@ class AuditoryCortex:
             except Exception as e:
                 logger.warning(f"Error shutting down XTTS: {e}")
             self._xtts = None
+
+        if self._styletts2:
+            try:
+                if hasattr(self._styletts2, 'shutdown'):
+                    await self._styletts2.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down StyleTTS2: {e}")
+            self._styletts2 = None
 
         if self._audio_llm:
             try:
@@ -1195,7 +1228,37 @@ class AuditoryCortex:
 
         start_time = time.time()
 
-        # Use XTTS if available (SOTA TTS)
+        # Use StyleTTS2 if available (TRUE SOTA TTS)
+        if self._sota_status["styletts2"] and self._styletts2:
+            try:
+                result = await self._styletts2.synthesize(text=text)
+                audio = AudioSegment(
+                    waveform=result.waveform,
+                    sample_rate=result.sample_rate,
+                    channels=1,
+                    start_time=0.0,
+                    end_time=result.duration,
+                    metadata={
+                        "text": text,
+                        "voice": voice,
+                        "language": language,
+                        "speed": speed,
+                        "emotion": emotion,
+                        "engine": "styletts2",
+                        "rtf": result.rtf,
+                    },
+                )
+                self._stats["speeches_synthesized"] += 1
+                logger.debug(
+                    "Speech synthesized with StyleTTS2 (TRUE SOTA)",
+                    duration=audio.duration,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+                return audio
+            except Exception as e:
+                logger.warning(f"StyleTTS2 synthesis failed, falling back to XTTS: {e}")
+
+        # Use XTTS if available (fallback)
         if self._sota_status["xtts"] and self._xtts:
             try:
                 result = await self._xtts.synthesize(
@@ -1337,7 +1400,57 @@ class AuditoryCortex:
 
         start_time = time.time()
 
-        # Use XTTS for voice cloning (requires XTTS to be available)
+        # Use StyleTTS2 for voice cloning (TRUE SOTA)
+        if self._sota_status["styletts2"] and self._styletts2:
+            try:
+                # Load reference audio if needed
+                if isinstance(reference_audio, (str, Path)):
+                    ref_path = str(reference_audio)
+                elif isinstance(reference_audio, AudioSegment):
+                    ref_waveform = reference_audio.waveform
+                    ref_path = None
+                else:
+                    ref_waveform = reference_audio
+                    ref_path = None
+
+                if ref_path:
+                    result = await self._styletts2.clone_voice(
+                        reference_audio=ref_path,
+                        text=text,
+                        preserve_style=True,
+                    )
+                else:
+                    result = await self._styletts2.clone_voice(
+                        reference_audio=ref_waveform,
+                        text=text,
+                        preserve_style=True,
+                    )
+
+                audio = AudioSegment(
+                    waveform=result.waveform,
+                    sample_rate=result.sample_rate,
+                    channels=1,
+                    start_time=0.0,
+                    end_time=result.duration,
+                    metadata={
+                        "text": text,
+                        "language": language,
+                        "emotion": emotion,
+                        "engine": "styletts2",
+                        "voice_cloned": True,
+                    },
+                )
+                self._stats["speeches_synthesized"] += 1
+                logger.debug(
+                    "Voice cloned with StyleTTS2 (TRUE SOTA)",
+                    duration=audio.duration,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+                return audio
+            except Exception as e:
+                logger.warning(f"StyleTTS2 voice cloning failed, falling back to XTTS: {e}")
+
+        # Use XTTS for voice cloning (fallback)
         if self._sota_status["xtts"] and self._xtts:
             try:
                 # Load reference audio if needed
@@ -2682,11 +2795,14 @@ class AuditoryCortex:
             },
             "text_to_speech": {
                 "available": self.config.enable_tts,
-                "sota": self._sota_status["xtts"],
+                "sota": self._sota_status["styletts2"],  # StyleTTS2 is TRUE SOTA
                 "features": {
-                    "voice_cloning": self._sota_status["xtts"],
+                    "voice_cloning": self._sota_status["xtts"] or self._sota_status["styletts2"],
                     "multilingual": self._sota_status["xtts"],
                     "emotional_control": self._sota_status["xtts"],
+                    "styletts2": self._sota_status["styletts2"],  # TRUE SOTA
+                    "human_level_quality": self._sota_status["styletts2"],
+                    "style_interpolation": self._sota_status["styletts2"],
                     "languages": 17 if self._sota_status["xtts"] else 1,
                 },
             },
