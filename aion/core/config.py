@@ -1,0 +1,237 @@
+"""
+AION Configuration Management System
+
+Centralized configuration for all AION subsystems with:
+- Environment-based configuration
+- Type-safe settings with Pydantic
+- Runtime configuration updates
+- Hierarchical configuration merging
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Optional, Literal
+from enum import Enum
+import json
+
+from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings
+
+
+class LogLevel(str, Enum):
+    """Logging levels for AION."""
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+
+class LLMProviderConfig(BaseModel):
+    """Configuration for LLM providers."""
+    provider: Literal["openai", "anthropic", "local", "mock"] = "openai"
+    model: str = "gpt-4-turbo-preview"
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    timeout: float = 60.0
+    max_retries: int = 3
+
+
+class MemoryConfig(BaseModel):
+    """Configuration for the Vector Memory System."""
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_dimension: int = 384
+    index_type: Literal["flat", "ivf", "hnsw"] = "flat"
+    nlist: int = 100  # For IVF index
+    nprobe: int = 10  # For IVF search
+    ef_construction: int = 200  # For HNSW
+    ef_search: int = 50  # For HNSW
+    max_memories: int = 1_000_000
+    consolidation_interval: int = 3600  # seconds
+    importance_threshold: float = 0.3
+    forgetting_rate: float = 0.01
+    persistence_path: Optional[Path] = None
+
+
+class PlanningConfig(BaseModel):
+    """Configuration for the Planning Graph System."""
+    max_plan_depth: int = 20
+    max_parallel_branches: int = 5
+    default_timeout: float = 300.0  # seconds per step
+    checkpoint_interval: int = 1  # checkpoint every N steps
+    max_retries_per_step: int = 3
+    enable_visualization: bool = True
+    cache_plans: bool = True
+
+
+class ToolConfig(BaseModel):
+    """Configuration for the Tool Orchestration System."""
+    max_parallel_tools: int = 10
+    default_rate_limit: float = 10.0  # requests per second
+    tool_timeout: float = 60.0
+    enable_learning: bool = True
+    performance_tracking: bool = True
+    sandbox_mode: bool = True
+
+
+class EvolutionConfig(BaseModel):
+    """Configuration for the Self-Improvement Engine."""
+    enable_self_improvement: bool = True
+    improvement_interval: int = 3600  # seconds
+    min_samples_for_optimization: int = 100
+    safety_threshold: float = 0.95  # minimum performance to maintain
+    max_parameter_change: float = 0.1  # max % change per iteration
+    hypothesis_batch_size: int = 5
+    rollback_on_degradation: bool = True
+    require_approval_for_changes: bool = True
+
+
+class VisionConfig(BaseModel):
+    """Configuration for the Visual Cortex System."""
+    detection_model: str = "facebook/detr-resnet-50"
+    captioning_model: str = "Salesforce/blip-image-captioning-base"
+    segmentation_model: str = "nvidia/segformer-b0-finetuned-ade-512-512"
+    max_image_size: int = 1024
+    enable_visual_memory: bool = True
+    attention_threshold: float = 0.5
+    scene_graph_enabled: bool = True
+
+
+class SecurityConfig(BaseModel):
+    """Configuration for the Security System."""
+    require_approval_for_high_risk: bool = True
+    auto_approve_low_risk: bool = True
+    approval_timeout: float = 300.0  # seconds
+    max_pending_approvals: int = 10
+    audit_all_actions: bool = True
+    rate_limit_requests: bool = True
+    requests_per_minute: int = 60
+    enable_sandboxing: bool = True
+    blocked_operations: list[str] = Field(default_factory=list)
+
+
+class MonitoringConfig(BaseModel):
+    """Configuration for system monitoring."""
+    enable_metrics: bool = True
+    metrics_interval: int = 60  # seconds
+    enable_tracing: bool = True
+    log_level: LogLevel = LogLevel.INFO
+    log_format: Literal["json", "text"] = "json"
+    performance_alerts: bool = True
+    alert_threshold_latency_ms: float = 1000.0
+    alert_threshold_error_rate: float = 0.05
+
+
+class AIONConfig(BaseSettings):
+    """
+    Main AION Configuration
+
+    Loads configuration from environment variables and/or config files.
+    Environment variables are prefixed with AION_ (e.g., AION_LOG_LEVEL=DEBUG)
+    """
+
+    # System identification
+    instance_id: str = Field(default="aion-primary")
+    environment: Literal["development", "staging", "production"] = "development"
+
+    # Server configuration
+    host: str = "0.0.0.0"
+    port: int = 8000
+    workers: int = 4
+    debug: bool = False
+
+    # Subsystem configurations
+    llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    planning: PlanningConfig = Field(default_factory=PlanningConfig)
+    tools: ToolConfig = Field(default_factory=ToolConfig)
+    evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
+    vision: VisionConfig = Field(default_factory=VisionConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+
+    # Data paths
+    data_dir: Path = Field(default=Path("./data"))
+    checkpoints_dir: Path = Field(default=Path("./checkpoints"))
+    logs_dir: Path = Field(default=Path("./logs"))
+
+    model_config = {
+        "env_prefix": "AION_",
+        "env_nested_delimiter": "__",
+        "case_sensitive": False,
+    }
+
+    @field_validator("data_dir", "checkpoints_dir", "logs_dir", mode="before")
+    @classmethod
+    def ensure_path(cls, v: Any) -> Path:
+        """Ensure value is converted to Path."""
+        if isinstance(v, str):
+            return Path(v)
+        return v
+
+    def ensure_directories(self) -> None:
+        """Create all required directories if they don't exist."""
+        for dir_path in [self.data_dir, self.checkpoints_dir, self.logs_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def from_file(cls, config_path: Path) -> "AIONConfig":
+        """Load configuration from a JSON file."""
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        with open(config_path) as f:
+            config_data = json.load(f)
+
+        return cls(**config_data)
+
+    def to_file(self, config_path: Path) -> None:
+        """Save configuration to a JSON file."""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(self.model_dump(), f, indent=2, default=str)
+
+    def get_llm_api_key(self) -> Optional[str]:
+        """Get the LLM API key from config or environment."""
+        if self.llm.api_key:
+            return self.llm.api_key
+
+        # Try environment variables
+        env_keys = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }
+
+        env_var = env_keys.get(self.llm.provider)
+        if env_var:
+            return os.environ.get(env_var)
+
+        return None
+
+
+# Global configuration instance (lazy loaded)
+_config: Optional[AIONConfig] = None
+
+
+def get_config() -> AIONConfig:
+    """Get the global AION configuration instance."""
+    global _config
+    if _config is None:
+        _config = AIONConfig()
+    return _config
+
+
+def set_config(config: AIONConfig) -> None:
+    """Set the global AION configuration instance."""
+    global _config
+    _config = config
+
+
+def reset_config() -> None:
+    """Reset the global configuration to default."""
+    global _config
+    _config = None

@@ -1,0 +1,92 @@
+{
+  "instance_id": "aion-primary",
+  "environment": "development",
+  "host": "0.0.0.0",
+  "port": 8000,
+  "debug": false,
+
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-4-turbo-preview",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "timeout": 60.0,
+    "max_retries": 3
+  },
+
+  "memory": {
+    "embedding_model": "all-MiniLM-L6-v2",
+    "embedding_dimension": 384,
+    "index_type": "flat",
+    "max_memories": 100000,
+    "consolidation_interval": 3600,
+    "importance_threshold": 0.3,
+    "forgetting_rate": 0.01
+  },
+
+  "planning": {
+    "max_plan_depth": 20,
+    "max_parallel_branches": 5,
+    "default_timeout": 300.0,
+    "checkpoint_interval": 1,
+    "max_retries_per_step": 3,
+    "enable_visualization": true,
+    "cache_plans": true
+  },
+
+  "tools": {
+    "max_parallel_tools": 10,
+    "default_rate_limit": 10.0,
+    "tool_timeout": 60.0,
+    "enable_learning": true,
+    "performance_tracking": true,
+    "sandbox_mode": true
+  },
+
+  "evolution": {
+    "enable_self_improvement": true,
+    "improvement_interval": 3600,
+    "min_samples_for_optimization": 100,
+    "safety_threshold": 0.95,
+    "max_parameter_change": 0.1,
+    "hypothesis_batch_size": 5,
+    "rollback_on_degradation": true,
+    "require_approval_for_changes": true
+  },
+
+  "vision": {
+    "detection_model": "facebook/detr-resnet-50",
+    "captioning_model": "Salesforce/blip-image-captioning-base",
+    "max_image_size": 1024,
+    "enable_visual_memory": true,
+    "attention_threshold": 0.5,
+    "scene_graph_enabled": true
+  },
+
+  "security": {
+    "require_approval_for_high_risk": true,
+    "auto_approve_low_risk": true,
+    "approval_timeout": 300.0,
+    "max_pending_approvals": 10,
+    "audit_all_actions": true,
+    "rate_limit_requests": true,
+    "requests_per_minute": 60,
+    "enable_sandboxing": true,
+    "blocked_operations": []
+  },
+
+  "monitoring": {
+    "enable_metrics": true,
+    "metrics_interval": 60,
+    "enable_tracing": true,
+    "log_level": "INFO",
+    "log_format": "json",
+    "performance_alerts": true,
+    "alert_threshold_latency_ms": 1000.0,
+    "alert_threshold_error_rate": 0.05
+  },
+
+  "data_dir": "./data",
+  "checkpoints_dir": "./checkpoints",
+  "logs_dir": "./logs"
+}
