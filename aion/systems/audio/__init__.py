@@ -116,6 +116,30 @@ from aion.systems.audio.reasoning import (
     MultiModalReasoner,
 )
 
+# SOTA model integrations (optional, require additional dependencies)
+try:
+    from aion.systems.audio.sota_models import (
+        # Whisper-X
+        WhisperXConfig,
+        WhisperXTranscriber,
+        # Emotion Recognition
+        EmotionResult,
+        SpeechEmotionRecognizer,
+        # Source Separation
+        SeparatedSources,
+        AudioSourceSeparator,
+        # Advanced TTS
+        XTTSConfig,
+        XTTSSynthesizer,
+        # Audio LLM
+        AudioLanguageModel,
+        # Combined Engine
+        SOTAAudioEngine,
+    )
+    _SOTA_AVAILABLE = True
+except ImportError:
+    _SOTA_AVAILABLE = False
+
 __all__ = [
     # Main interface
     "AuditoryCortex",
@@ -170,4 +194,15 @@ __all__ = [
     "ReasoningContext",
     "AudioReasoner",
     "MultiModalReasoner",
+    # SOTA models (conditionally available)
+    "WhisperXConfig",
+    "WhisperXTranscriber",
+    "EmotionResult",
+    "SpeechEmotionRecognizer",
+    "SeparatedSources",
+    "AudioSourceSeparator",
+    "XTTSConfig",
+    "XTTSSynthesizer",
+    "AudioLanguageModel",
+    "SOTAAudioEngine",
 ]

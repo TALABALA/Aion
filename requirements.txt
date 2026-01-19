@@ -54,29 +54,39 @@ pytest-asyncio>=0.23.0
 # Type Checking
 mypy>=1.8.0
 
-# Audio Processing
+# ==================== Audio Processing ====================
 librosa>=0.10.0
 soundfile>=0.12.0
 pydub>=0.25.0
 audioread>=3.0.0
 
-# Speech Recognition (Whisper)
-# Note: Uses transformers for Whisper, already included above
-# For faster inference, optionally install: faster-whisper>=0.10.0
+# Speech Recognition - Core
+# Whisper via transformers (included above)
 
 # Speaker Diarization
 pyannote.audio>=3.1.0
 
-# Text-to-Speech
-# Note: Uses transformers for Bark TTS
-# For Coqui TTS: TTS>=0.22.0
-
-# Audio Understanding
-# Note: Uses transformers for Audio Spectrogram Transformer
-
 # Speaker Recognition
 speechbrain>=1.0.0
-# For lightweight embeddings: resemblyzer>=0.1.3
 
-# Audio-Text Embeddings (CLAP)
-# Uses transformers, already included
+# ==================== SOTA Audio (Optional) ====================
+# Uncomment these for state-of-the-art performance:
+
+# Whisper-X: SOTA transcription with accurate word alignment
+# pip install whisperx
+# whisperx>=3.1.0
+
+# Source Separation (Demucs): Separate vocals/instruments
+# pip install demucs
+# demucs>=4.0.0
+
+# XTTS-v2: High-quality TTS with voice cloning
+# pip install TTS
+# TTS>=0.22.0
+
+# Faster Whisper: Optimized inference (4x faster)
+# pip install faster-whisper
+# faster-whisper>=0.10.0
+
+# Audio Language Models (Qwen-Audio requires special install)
+# See: https://github.com/QwenLM/Qwen-Audio
