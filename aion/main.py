@@ -26,6 +26,7 @@ from aion.api.routes import (
     setup_tool_routes,
     setup_evolution_routes,
     setup_vision_routes,
+    setup_audio_routes,
 )
 
 
@@ -88,6 +89,9 @@ async def lifespan(app: FastAPI):
     if kernel.vision:
         setup_vision_routes(app, kernel.vision)
 
+    if kernel.audio:
+        setup_audio_routes(app, kernel.audio)
+
     logger.info("AION system ready", status=kernel.get_status())
 
     yield
@@ -124,7 +128,8 @@ def create_app(config: Optional[AIONConfig] = None) -> FastAPI:
         - Vector Memory Search (FAISS)
         - Tool Orchestration
         - Self-Improvement Loop
-        - Visual Cortex
+        - Visual Cortex (computer vision)
+        - Auditory Cortex (audio perception & understanding)
 
         This API provides access to all AION subsystems for building
         intelligent applications.
