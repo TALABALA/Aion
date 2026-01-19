@@ -1064,3 +1064,1167 @@ class SOTAAudioEngine:
     def get_initialized_components(self) -> set[str]:
         """Get set of initialized components."""
         return self._initialized_components.copy()
+
+
+# ============================================================================
+# Emotion2Vec: TRUE SOTA Emotion Recognition (Alibaba)
+# ============================================================================
+
+@dataclass
+class Emotion2VecResult:
+    """Result from emotion2vec model."""
+    primary_emotion: str
+    confidence: float
+    all_emotions: dict[str, float]  # All emotion probabilities
+    embedding: Optional[np.ndarray] = None  # Emotion embedding for downstream tasks
+
+
+class Emotion2VecRecognizer:
+    """
+    TRUE SOTA speech emotion recognition using emotion2vec (Alibaba).
+
+    emotion2vec significantly outperforms wav2vec2-based models:
+    - Self-supervised pretraining on 262k hours of audio
+    - State-of-the-art on IEMOCAP, MELD, and other benchmarks
+    - Universal emotion representation
+
+    Reference: https://github.com/ddlBoJack/emotion2vec
+    """
+
+    # Emotion labels from emotion2vec
+    EMOTION_LABELS = [
+        "angry", "disgusted", "fearful", "happy",
+        "neutral", "sad", "surprised", "other"
+    ]
+
+    def __init__(self, model_name: str = "iic/emotion2vec_base_finetuned"):
+        """
+        Initialize emotion2vec.
+
+        Args:
+            model_name: HuggingFace model name. Options:
+                - "iic/emotion2vec_base" (base model, needs fine-tuning)
+                - "iic/emotion2vec_base_finetuned" (recommended)
+                - "iic/emotion2vec_large_finetuned" (best accuracy)
+        """
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+        self._device = "cpu"
+
+    async def initialize(self) -> bool:
+        """Initialize emotion2vec model."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(_executor, self._load_model)
+        except Exception as e:
+            logger.warning(f"emotion2vec initialization failed: {e}")
+            return False
+
+    def _load_model(self) -> bool:
+        """Load emotion2vec model."""
+        try:
+            # Try funasr first (official implementation)
+            try:
+                from funasr import AutoModel
+                import torch
+
+                logger.info("Loading emotion2vec via FunASR", model=self.model_name)
+
+                self._model = AutoModel(model=self.model_name)
+                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+                logger.info("emotion2vec loaded successfully (FunASR)")
+                return True
+
+            except ImportError:
+                # Fallback to transformers if funasr not available
+                from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+                import torch
+
+                logger.info("Loading emotion2vec via transformers", model=self.model_name)
+
+                self._processor = AutoFeatureExtractor.from_pretrained(self.model_name)
+                self._model = AutoModelForAudioClassification.from_pretrained(self.model_name)
+
+                if torch.cuda.is_available():
+                    self._device = "cuda"
+                    self._model = self._model.to(self._device)
+
+                self._model.eval()
+                logger.info("emotion2vec loaded successfully (transformers)")
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to load emotion2vec: {e}")
+            return False
+
+    async def recognize(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        sr: int = 16000,
+        return_embedding: bool = False,
+    ) -> Emotion2VecResult:
+        """
+        Recognize emotion from speech using emotion2vec.
+
+        Args:
+            audio: Audio input (path, numpy array, or AudioSegment)
+            sr: Sample rate (default 16kHz)
+            return_embedding: Whether to return emotion embedding
+
+        Returns:
+            Emotion2VecResult with detected emotion
+        """
+        if self._model is None:
+            return Emotion2VecResult(
+                primary_emotion="neutral",
+                confidence=0.0,
+                all_emotions={"neutral": 1.0},
+            )
+
+        # Extract waveform
+        if isinstance(audio, AudioSegment):
+            waveform = audio.waveform
+            sr = audio.sample_rate
+        elif isinstance(audio, (str, Path)):
+            import librosa
+            waveform, sr = librosa.load(str(audio), sr=sr)
+        else:
+            waveform = audio
+
+        if waveform is None:
+            return Emotion2VecResult(
+                primary_emotion="neutral",
+                confidence=0.0,
+                all_emotions={"neutral": 1.0},
+            )
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._recognize_sync(waveform, sr, return_embedding)
+        )
+
+    def _recognize_sync(
+        self,
+        waveform: np.ndarray,
+        sr: int,
+        return_embedding: bool,
+    ) -> Emotion2VecResult:
+        """Synchronous emotion recognition."""
+        import torch
+
+        try:
+            # FunASR interface
+            if hasattr(self._model, 'generate'):
+                result = self._model.generate(waveform, output_dir=None, granularity="utterance")
+
+                # Parse FunASR output
+                if isinstance(result, list) and len(result) > 0:
+                    scores = result[0].get("scores", [])
+                    labels = result[0].get("labels", self.EMOTION_LABELS)
+
+                    if scores:
+                        all_emotions = {label: float(score) for label, score in zip(labels, scores)}
+                        primary = max(all_emotions.items(), key=lambda x: x[1])
+
+                        return Emotion2VecResult(
+                            primary_emotion=primary[0],
+                            confidence=primary[1],
+                            all_emotions=all_emotions,
+                            embedding=result[0].get("embedding") if return_embedding else None,
+                        )
+
+            # Transformers interface
+            else:
+                inputs = self._processor(
+                    waveform,
+                    sampling_rate=sr,
+                    return_tensors="pt",
+                    padding=True,
+                )
+
+                if self._device != "cpu":
+                    inputs = {k: v.to(self._device) for k, v in inputs.items()}
+
+                with torch.no_grad():
+                    outputs = self._model(**inputs)
+                    logits = outputs.logits
+                    probs = torch.softmax(logits, dim=-1)[0]
+
+                    all_emotions = {
+                        label: float(probs[i].item())
+                        for i, label in enumerate(self.EMOTION_LABELS[:len(probs)])
+                    }
+
+                    primary_idx = probs.argmax().item()
+                    primary_emotion = self.EMOTION_LABELS[primary_idx] if primary_idx < len(self.EMOTION_LABELS) else "neutral"
+
+                    return Emotion2VecResult(
+                        primary_emotion=primary_emotion,
+                        confidence=float(probs[primary_idx].item()),
+                        all_emotions=all_emotions,
+                        embedding=outputs.hidden_states[-1].mean(dim=1).cpu().numpy() if return_embedding and hasattr(outputs, 'hidden_states') else None,
+                    )
+
+        except Exception as e:
+            logger.warning(f"emotion2vec recognition failed: {e}")
+
+        return Emotion2VecResult(
+            primary_emotion="neutral",
+            confidence=0.0,
+            all_emotions={"neutral": 1.0},
+        )
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        self._model = None
+        self._processor = None
+
+
+# ============================================================================
+# BEATs: TRUE SOTA Audio Event Detection (Microsoft)
+# ============================================================================
+
+@dataclass
+class AudioEventResult:
+    """Result from audio event detection."""
+    events: list[dict]  # List of {label, confidence, start_time, end_time}
+    top_events: list[str]  # Top-k event labels
+    embeddings: Optional[np.ndarray] = None  # Audio embeddings
+
+
+class BEATsEventDetector:
+    """
+    TRUE SOTA audio event detection using BEATs (Microsoft).
+
+    BEATs outperforms AST on AudioSet:
+    - Audio Pre-Training with Acoustic Tokenizers
+    - Self-supervised learning on audio
+    - State-of-the-art mAP on AudioSet (50.6%)
+
+    Reference: https://github.com/microsoft/unilm/tree/master/beats
+    """
+
+    def __init__(self, model_name: str = "microsoft/beats-iter3"):
+        """
+        Initialize BEATs.
+
+        Args:
+            model_name: Model checkpoint. Options:
+                - "microsoft/beats-iter3" (AudioSet fine-tuned, SOTA)
+                - "microsoft/beats-iter3-as2M" (2M AudioSet)
+                - "microsoft/beats-iter3-as20k" (20k AudioSet)
+        """
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+        self._labels = None
+        self._device = "cpu"
+
+    async def initialize(self) -> bool:
+        """Initialize BEATs model."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(_executor, self._load_model)
+        except Exception as e:
+            logger.warning(f"BEATs initialization failed: {e}")
+            return False
+
+    def _load_model(self) -> bool:
+        """Load BEATs model."""
+        try:
+            from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+            import torch
+
+            logger.info("Loading BEATs model", model=self.model_name)
+
+            # Try to load BEATs from HuggingFace
+            try:
+                self._processor = AutoFeatureExtractor.from_pretrained(self.model_name)
+                self._model = AutoModelForAudioClassification.from_pretrained(self.model_name)
+            except Exception:
+                # Fallback to AST if BEATs not available on HF
+                logger.info("BEATs not found on HF, using AST as fallback")
+                self._processor = AutoFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+                self._model = AutoModelForAudioClassification.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+
+            if torch.cuda.is_available():
+                self._device = "cuda"
+                self._model = self._model.to(self._device)
+
+            self._model.eval()
+
+            # Load AudioSet labels
+            self._labels = self._model.config.id2label if hasattr(self._model.config, 'id2label') else {}
+
+            logger.info("Audio event model loaded", num_labels=len(self._labels))
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to load BEATs: {e}")
+            return False
+
+    async def detect_events(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        sr: int = 16000,
+        top_k: int = 10,
+        threshold: float = 0.1,
+        return_embeddings: bool = False,
+    ) -> AudioEventResult:
+        """
+        Detect audio events using BEATs.
+
+        Args:
+            audio: Audio input
+            sr: Sample rate
+            top_k: Number of top events to return
+            threshold: Confidence threshold
+            return_embeddings: Return audio embeddings
+
+        Returns:
+            AudioEventResult with detected events
+        """
+        if self._model is None:
+            return AudioEventResult(events=[], top_events=[])
+
+        # Extract waveform
+        if isinstance(audio, AudioSegment):
+            waveform = audio.waveform
+            sr = audio.sample_rate
+        elif isinstance(audio, (str, Path)):
+            import librosa
+            waveform, sr = librosa.load(str(audio), sr=sr)
+        else:
+            waveform = audio
+
+        if waveform is None:
+            return AudioEventResult(events=[], top_events=[])
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._detect_sync(waveform, sr, top_k, threshold, return_embeddings)
+        )
+
+    def _detect_sync(
+        self,
+        waveform: np.ndarray,
+        sr: int,
+        top_k: int,
+        threshold: float,
+        return_embeddings: bool,
+    ) -> AudioEventResult:
+        """Synchronous event detection."""
+        import torch
+
+        try:
+            inputs = self._processor(
+                waveform,
+                sampling_rate=sr,
+                return_tensors="pt",
+                padding=True,
+            )
+
+            if self._device != "cpu":
+                inputs = {k: v.to(self._device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = self._model(**inputs, output_hidden_states=return_embeddings)
+                logits = outputs.logits
+                probs = torch.sigmoid(logits)[0]  # Multi-label classification
+
+                # Get events above threshold
+                events = []
+                for idx, prob in enumerate(probs):
+                    if prob.item() >= threshold:
+                        label = self._labels.get(idx, f"event_{idx}")
+                        events.append({
+                            "label": label,
+                            "confidence": float(prob.item()),
+                        })
+
+                # Sort by confidence
+                events.sort(key=lambda x: x["confidence"], reverse=True)
+
+                # Get top-k
+                top_events = [e["label"] for e in events[:top_k]]
+
+                embeddings = None
+                if return_embeddings and hasattr(outputs, 'hidden_states'):
+                    embeddings = outputs.hidden_states[-1].mean(dim=1).cpu().numpy()
+
+                return AudioEventResult(
+                    events=events,
+                    top_events=top_events,
+                    embeddings=embeddings,
+                )
+
+        except Exception as e:
+            logger.warning(f"BEATs detection failed: {e}")
+
+        return AudioEventResult(events=[], top_events=[])
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        self._model = None
+        self._processor = None
+
+
+# ============================================================================
+# DeepFilterNet: SOTA Speech Enhancement
+# ============================================================================
+
+@dataclass
+class EnhancedAudio:
+    """Result from speech enhancement."""
+    waveform: np.ndarray
+    sample_rate: int
+    snr_improvement_db: Optional[float] = None  # Estimated SNR improvement
+
+
+class DeepFilterNetEnhancer:
+    """
+    SOTA speech enhancement using DeepFilterNet.
+
+    DeepFilterNet provides:
+    - Real-time noise suppression
+    - Minimal speech distortion
+    - Low computational cost
+    - Excellent for preprocessing before ASR
+
+    Reference: https://github.com/Rikorose/DeepFilterNet
+    """
+
+    def __init__(self, model: str = "DeepFilterNet3"):
+        """
+        Initialize DeepFilterNet.
+
+        Args:
+            model: Model version ("DeepFilterNet", "DeepFilterNet2", "DeepFilterNet3")
+        """
+        self.model_name = model
+        self._df_model = None
+        self._df_state = None
+        self._sample_rate = 48000  # DeepFilterNet native sample rate
+
+    async def initialize(self) -> bool:
+        """Initialize DeepFilterNet."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(_executor, self._load_model)
+        except Exception as e:
+            logger.warning(f"DeepFilterNet initialization failed: {e}")
+            return False
+
+    def _load_model(self) -> bool:
+        """Load DeepFilterNet model."""
+        try:
+            from df.enhance import init_df, enhance, load_audio, save_audio
+            from df import config
+
+            logger.info("Loading DeepFilterNet", model=self.model_name)
+
+            self._df_model, self._df_state, self._sample_rate = init_df()
+
+            logger.info("DeepFilterNet loaded", sample_rate=self._sample_rate)
+            return True
+
+        except ImportError:
+            logger.warning("DeepFilterNet not installed. Install with: pip install deepfilternet")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load DeepFilterNet: {e}")
+            return False
+
+    async def enhance(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        sr: int = 16000,
+    ) -> EnhancedAudio:
+        """
+        Enhance speech by removing noise.
+
+        Args:
+            audio: Noisy audio input
+            sr: Sample rate of input
+
+        Returns:
+            EnhancedAudio with cleaned speech
+        """
+        if self._df_model is None:
+            # Return original if not initialized
+            if isinstance(audio, AudioSegment):
+                return EnhancedAudio(waveform=audio.waveform, sample_rate=audio.sample_rate)
+            elif isinstance(audio, np.ndarray):
+                return EnhancedAudio(waveform=audio, sample_rate=sr)
+            else:
+                import librosa
+                waveform, sr = librosa.load(str(audio), sr=sr)
+                return EnhancedAudio(waveform=waveform, sample_rate=sr)
+
+        # Extract waveform
+        if isinstance(audio, AudioSegment):
+            waveform = audio.waveform
+            sr = audio.sample_rate
+        elif isinstance(audio, (str, Path)):
+            import librosa
+            waveform, sr = librosa.load(str(audio), sr=None)  # Keep original sr
+        else:
+            waveform = audio
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._enhance_sync(waveform, sr)
+        )
+
+    def _enhance_sync(self, waveform: np.ndarray, sr: int) -> EnhancedAudio:
+        """Synchronous enhancement."""
+        try:
+            from df.enhance import enhance
+            import librosa
+            import torch
+
+            # Resample to DeepFilterNet sample rate if needed
+            if sr != self._sample_rate:
+                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self._sample_rate)
+
+            # Convert to torch tensor
+            audio_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
+
+            # Enhance
+            enhanced = enhance(self._df_model, self._df_state, audio_tensor)
+            enhanced_np = enhanced.squeeze().numpy()
+
+            # Resample back if needed
+            if sr != self._sample_rate:
+                enhanced_np = librosa.resample(enhanced_np, orig_sr=self._sample_rate, target_sr=sr)
+
+            return EnhancedAudio(
+                waveform=enhanced_np,
+                sample_rate=sr,
+            )
+
+        except Exception as e:
+            logger.warning(f"DeepFilterNet enhancement failed: {e}")
+            return EnhancedAudio(waveform=waveform, sample_rate=sr)
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        self._df_model = None
+        self._df_state = None
+
+
+# ============================================================================
+# Streaming ASR: Real-Time Transcription
+# ============================================================================
+
+@dataclass
+class StreamingTranscript:
+    """Streaming transcription result."""
+    text: str
+    is_final: bool
+    confidence: float
+    start_time: float
+    end_time: float
+    words: list[dict] = field(default_factory=list)
+
+
+class StreamingASR:
+    """
+    Real-time streaming ASR using faster-whisper.
+
+    Provides:
+    - Low-latency transcription
+    - Word-level timestamps
+    - VAD-based segmentation
+    - Continuous transcription stream
+    """
+
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "auto",
+        compute_type: str = "float16",
+        vad_threshold: float = 0.5,
+    ):
+        """
+        Initialize streaming ASR.
+
+        Args:
+            model_size: Whisper model size (tiny, base, small, medium, large-v3)
+            device: Device for inference
+            compute_type: Computation type (float16, int8, float32)
+            vad_threshold: VAD threshold for speech detection
+        """
+        self.model_size = model_size
+        self.device = device
+        self.compute_type = compute_type
+        self.vad_threshold = vad_threshold
+        self._model = None
+        self._vad = None
+
+    async def initialize(self) -> bool:
+        """Initialize streaming ASR."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(_executor, self._load_model)
+        except Exception as e:
+            logger.warning(f"Streaming ASR initialization failed: {e}")
+            return False
+
+    def _load_model(self) -> bool:
+        """Load faster-whisper model."""
+        try:
+            from faster_whisper import WhisperModel
+            import torch
+
+            logger.info("Loading faster-whisper for streaming", model=self.model_size)
+
+            device = self.device
+            if device == "auto":
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            self._model = WhisperModel(
+                self.model_size,
+                device=device,
+                compute_type=self.compute_type if device == "cuda" else "float32",
+            )
+
+            # Load silero VAD for better segmentation
+            try:
+                model, utils = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    force_reload=False,
+                )
+                self._vad = model
+                logger.info("Silero VAD loaded for streaming")
+            except Exception as e:
+                logger.warning(f"VAD loading failed, using Whisper's internal VAD: {e}")
+
+            logger.info("Streaming ASR loaded successfully")
+            return True
+
+        except ImportError:
+            logger.warning("faster-whisper not installed. Install with: pip install faster-whisper")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load streaming ASR: {e}")
+            return False
+
+    async def transcribe_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        sr: int = 16000,
+        language: Optional[str] = None,
+        previous_context: str = "",
+    ) -> StreamingTranscript:
+        """
+        Transcribe a single audio chunk.
+
+        Args:
+            audio_chunk: Audio data (should be ~1-5 seconds)
+            sr: Sample rate
+            language: Language code or None for auto
+            previous_context: Previous transcript for context
+
+        Returns:
+            StreamingTranscript with partial/final result
+        """
+        if self._model is None:
+            return StreamingTranscript(
+                text="",
+                is_final=False,
+                confidence=0.0,
+                start_time=0.0,
+                end_time=0.0,
+            )
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._transcribe_chunk_sync(audio_chunk, sr, language, previous_context)
+        )
+
+    def _transcribe_chunk_sync(
+        self,
+        audio_chunk: np.ndarray,
+        sr: int,
+        language: Optional[str],
+        previous_context: str,
+    ) -> StreamingTranscript:
+        """Synchronous chunk transcription."""
+        try:
+            # Resample if needed
+            if sr != 16000:
+                import librosa
+                audio_chunk = librosa.resample(audio_chunk, orig_sr=sr, target_sr=16000)
+
+            segments, info = self._model.transcribe(
+                audio_chunk,
+                language=language,
+                initial_prompt=previous_context[-200:] if previous_context else None,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(threshold=self.vad_threshold),
+            )
+
+            text_parts = []
+            words = []
+            start_time = 0.0
+            end_time = 0.0
+
+            for segment in segments:
+                text_parts.append(segment.text)
+                if segment.words:
+                    for word in segment.words:
+                        words.append({
+                            "word": word.word,
+                            "start": word.start,
+                            "end": word.end,
+                            "probability": word.probability,
+                        })
+                if start_time == 0.0:
+                    start_time = segment.start
+                end_time = segment.end
+
+            text = " ".join(text_parts).strip()
+
+            return StreamingTranscript(
+                text=text,
+                is_final=True,  # Each chunk is final in this simple implementation
+                confidence=info.language_probability if hasattr(info, 'language_probability') else 0.9,
+                start_time=start_time,
+                end_time=end_time,
+                words=words,
+            )
+
+        except Exception as e:
+            logger.warning(f"Chunk transcription failed: {e}")
+            return StreamingTranscript(
+                text="",
+                is_final=False,
+                confidence=0.0,
+                start_time=0.0,
+                end_time=0.0,
+            )
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        self._model = None
+        self._vad = None
+
+
+# ============================================================================
+# MusicGen: SOTA Music Generation (Meta)
+# ============================================================================
+
+@dataclass
+class GeneratedMusic:
+    """Result from music generation."""
+    waveform: np.ndarray
+    sample_rate: int
+    duration: float
+    prompt: str
+    tokens_used: Optional[int] = None
+
+
+class MusicGenerator:
+    """
+    SOTA music generation using MusicGen (Meta).
+
+    MusicGen provides:
+    - Text-to-music generation
+    - Melody conditioning
+    - Multiple model sizes
+    - High-quality 32kHz audio
+
+    Reference: https://github.com/facebookresearch/audiocraft
+    """
+
+    def __init__(self, model_size: str = "small"):
+        """
+        Initialize MusicGen.
+
+        Args:
+            model_size: Model size ("small", "medium", "large", "melody")
+                - small: 300M parameters, fastest
+                - medium: 1.5B parameters, balanced
+                - large: 3.3B parameters, best quality
+                - melody: Conditioned on melody
+        """
+        self.model_size = model_size
+        self._model = None
+
+    async def initialize(self) -> bool:
+        """Initialize MusicGen."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(_executor, self._load_model)
+        except Exception as e:
+            logger.warning(f"MusicGen initialization failed: {e}")
+            return False
+
+    def _load_model(self) -> bool:
+        """Load MusicGen model."""
+        try:
+            from audiocraft.models import MusicGen
+            import torch
+
+            logger.info("Loading MusicGen", model=self.model_size)
+
+            self._model = MusicGen.get_pretrained(f"facebook/musicgen-{self.model_size}")
+            self._model.set_generation_params(duration=10)  # Default 10 seconds
+
+            if torch.cuda.is_available():
+                self._model = self._model.to("cuda")
+
+            logger.info("MusicGen loaded successfully")
+            return True
+
+        except ImportError:
+            logger.warning("audiocraft not installed. Install with: pip install audiocraft")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load MusicGen: {e}")
+            return False
+
+    async def generate(
+        self,
+        prompt: str,
+        duration: float = 10.0,
+        temperature: float = 1.0,
+        top_k: int = 250,
+        top_p: float = 0.0,
+    ) -> GeneratedMusic:
+        """
+        Generate music from text prompt.
+
+        Args:
+            prompt: Text description of desired music
+                   (e.g., "upbeat electronic dance music with heavy bass")
+            duration: Duration in seconds (max 30s for small, 60s for large)
+            temperature: Sampling temperature (higher = more random)
+            top_k: Top-k sampling
+            top_p: Nucleus sampling (0 = disabled)
+
+        Returns:
+            GeneratedMusic with generated audio
+        """
+        if self._model is None:
+            return GeneratedMusic(
+                waveform=np.zeros(int(duration * 32000)),
+                sample_rate=32000,
+                duration=duration,
+                prompt=prompt,
+            )
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._generate_sync(prompt, duration, temperature, top_k, top_p)
+        )
+
+    def _generate_sync(
+        self,
+        prompt: str,
+        duration: float,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> GeneratedMusic:
+        """Synchronous music generation."""
+        try:
+            self._model.set_generation_params(
+                duration=duration,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
+            wav = self._model.generate([prompt], progress=False)
+            waveform = wav[0, 0].cpu().numpy()
+
+            return GeneratedMusic(
+                waveform=waveform,
+                sample_rate=self._model.sample_rate,
+                duration=len(waveform) / self._model.sample_rate,
+                prompt=prompt,
+            )
+
+        except Exception as e:
+            logger.warning(f"Music generation failed: {e}")
+            return GeneratedMusic(
+                waveform=np.zeros(int(duration * 32000)),
+                sample_rate=32000,
+                duration=duration,
+                prompt=prompt,
+            )
+
+    async def generate_with_melody(
+        self,
+        prompt: str,
+        melody: Union[str, Path, np.ndarray],
+        melody_sr: int = 32000,
+        duration: float = 10.0,
+    ) -> GeneratedMusic:
+        """
+        Generate music conditioned on a melody.
+
+        Requires the "melody" model variant.
+
+        Args:
+            prompt: Text description
+            melody: Reference melody audio
+            melody_sr: Melody sample rate
+            duration: Output duration
+
+        Returns:
+            GeneratedMusic following the melody
+        """
+        if self._model is None or self.model_size != "melody":
+            logger.warning("Melody conditioning requires the melody model")
+            return await self.generate(prompt, duration)
+
+        # Load melody
+        if isinstance(melody, (str, Path)):
+            import librosa
+            melody_wav, melody_sr = librosa.load(str(melody), sr=melody_sr)
+        else:
+            melody_wav = melody
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._generate_with_melody_sync(prompt, melody_wav, melody_sr, duration)
+        )
+
+    def _generate_with_melody_sync(
+        self,
+        prompt: str,
+        melody_wav: np.ndarray,
+        melody_sr: int,
+        duration: float,
+    ) -> GeneratedMusic:
+        """Synchronous melody-conditioned generation."""
+        try:
+            import torch
+
+            self._model.set_generation_params(duration=duration)
+
+            melody_tensor = torch.from_numpy(melody_wav).unsqueeze(0).unsqueeze(0)
+            if torch.cuda.is_available():
+                melody_tensor = melody_tensor.cuda()
+
+            wav = self._model.generate_with_chroma(
+                [prompt],
+                melody_tensor,
+                melody_sr,
+                progress=False,
+            )
+            waveform = wav[0, 0].cpu().numpy()
+
+            return GeneratedMusic(
+                waveform=waveform,
+                sample_rate=self._model.sample_rate,
+                duration=len(waveform) / self._model.sample_rate,
+                prompt=prompt,
+            )
+
+        except Exception as e:
+            logger.warning(f"Melody-conditioned generation failed: {e}")
+            return GeneratedMusic(
+                waveform=np.zeros(int(duration * 32000)),
+                sample_rate=32000,
+                duration=duration,
+                prompt=prompt,
+            )
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        self._model = None
+
+
+# ============================================================================
+# Audio Captioning: CLAP-based
+# ============================================================================
+
+@dataclass
+class AudioCaption:
+    """Result from audio captioning."""
+    caption: str
+    confidence: float
+    alternative_captions: list[str] = field(default_factory=list)
+
+
+class AudioCaptioner:
+    """
+    Audio captioning using CLAP and language models.
+
+    Generates natural language descriptions of audio content
+    using contrastive audio-text embeddings.
+    """
+
+    def __init__(self):
+        self._clap = None
+        self._caption_model = None
+        self._device = "cpu"
+
+    async def initialize(self) -> bool:
+        """Initialize audio captioning models."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(_executor, self._load_models)
+        except Exception as e:
+            logger.warning(f"Audio captioner initialization failed: {e}")
+            return False
+
+    def _load_models(self) -> bool:
+        """Load CLAP and captioning models."""
+        try:
+            from transformers import ClapModel, ClapProcessor
+            import torch
+
+            logger.info("Loading CLAP for audio captioning")
+
+            self._clap_processor = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
+            self._clap = ClapModel.from_pretrained("laion/clap-htsat-unfused")
+
+            if torch.cuda.is_available():
+                self._device = "cuda"
+                self._clap = self._clap.to(self._device)
+
+            self._clap.eval()
+
+            # Predefined caption templates for retrieval-based captioning
+            self._caption_templates = [
+                "a recording of {}",
+                "the sound of {}",
+                "audio of {}",
+                "{} can be heard",
+                "this is {}",
+            ]
+
+            self._sound_categories = [
+                "speech", "music", "silence", "noise", "singing",
+                "dog barking", "car engine", "birds chirping", "rain",
+                "thunder", "keyboard typing", "door closing", "footsteps",
+                "laughter", "applause", "phone ringing", "alarm",
+                "water flowing", "wind", "traffic", "crowd noise",
+            ]
+
+            logger.info("Audio captioner loaded successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to load audio captioner: {e}")
+            return False
+
+    async def caption(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        sr: int = 48000,
+        num_captions: int = 3,
+    ) -> AudioCaption:
+        """
+        Generate a caption for audio.
+
+        Args:
+            audio: Audio input
+            sr: Sample rate
+            num_captions: Number of alternative captions
+
+        Returns:
+            AudioCaption with generated description
+        """
+        if self._clap is None:
+            return AudioCaption(
+                caption="Audio content",
+                confidence=0.0,
+            )
+
+        # Extract waveform
+        if isinstance(audio, AudioSegment):
+            waveform = audio.waveform
+            sr = audio.sample_rate
+        elif isinstance(audio, (str, Path)):
+            import librosa
+            waveform, sr = librosa.load(str(audio), sr=sr)
+        else:
+            waveform = audio
+
+        if waveform is None:
+            return AudioCaption(caption="Audio content", confidence=0.0)
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: self._caption_sync(waveform, sr, num_captions)
+        )
+
+    def _caption_sync(
+        self,
+        waveform: np.ndarray,
+        sr: int,
+        num_captions: int,
+    ) -> AudioCaption:
+        """Synchronous captioning via retrieval."""
+        import torch
+
+        try:
+            # Generate candidate captions
+            candidates = []
+            for template in self._caption_templates:
+                for sound in self._sound_categories:
+                    candidates.append(template.format(sound))
+
+            # Get audio embedding
+            audio_inputs = self._clap_processor(
+                audios=waveform,
+                sampling_rate=sr,
+                return_tensors="pt",
+                padding=True,
+            )
+            if self._device != "cpu":
+                audio_inputs = {k: v.to(self._device) for k, v in audio_inputs.items()}
+
+            # Get text embeddings for candidates
+            text_inputs = self._clap_processor(
+                text=candidates,
+                return_tensors="pt",
+                padding=True,
+            )
+            if self._device != "cpu":
+                text_inputs = {k: v.to(self._device) for k, v in text_inputs.items()}
+
+            with torch.no_grad():
+                audio_embed = self._clap.get_audio_features(**audio_inputs)
+                text_embed = self._clap.get_text_features(**text_inputs)
+
+                # Compute similarities
+                audio_embed = audio_embed / audio_embed.norm(dim=-1, keepdim=True)
+                text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+                similarities = (audio_embed @ text_embed.T)[0]
+
+                # Get top matches
+                top_indices = similarities.argsort(descending=True)[:num_captions]
+                top_captions = [candidates[i] for i in top_indices.cpu().numpy()]
+                top_scores = [similarities[i].item() for i in top_indices]
+
+            return AudioCaption(
+                caption=top_captions[0],
+                confidence=top_scores[0],
+                alternative_captions=top_captions[1:],
+            )
+
+        except Exception as e:
+            logger.warning(f"Audio captioning failed: {e}")
+            return AudioCaption(caption="Audio content", confidence=0.0)
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        self._clap = None

@@ -122,9 +122,12 @@ try:
         # Whisper-X
         WhisperXConfig,
         WhisperXTranscriber,
-        # Emotion Recognition
+        # Emotion Recognition (wav2vec2-based)
         EmotionResult,
         SpeechEmotionRecognizer,
+        # TRUE SOTA Emotion (emotion2vec)
+        Emotion2VecResult,
+        Emotion2VecRecognizer,
         # Source Separation
         SeparatedSources,
         AudioSourceSeparator,
@@ -135,6 +138,21 @@ try:
         AudioLanguageModel,
         # Combined Engine
         SOTAAudioEngine,
+        # TRUE SOTA Audio Events (BEATs)
+        AudioEventResult,
+        BEATsEventDetector,
+        # Speech Enhancement
+        EnhancedAudio,
+        DeepFilterNetEnhancer,
+        # Streaming ASR
+        StreamingTranscript,
+        StreamingASR,
+        # Music Generation
+        GeneratedMusic,
+        MusicGenerator,
+        # Audio Captioning
+        AudioCaption,
+        AudioCaptioner,
     )
     _SOTA_AVAILABLE = True
 except ImportError:
@@ -205,4 +223,17 @@ __all__ = [
     "XTTSSynthesizer",
     "AudioLanguageModel",
     "SOTAAudioEngine",
+    # TRUE SOTA additions
+    "Emotion2VecResult",
+    "Emotion2VecRecognizer",
+    "AudioEventResult",
+    "BEATsEventDetector",
+    "EnhancedAudio",
+    "DeepFilterNetEnhancer",
+    "StreamingTranscript",
+    "StreamingASR",
+    "GeneratedMusic",
+    "MusicGenerator",
+    "AudioCaption",
+    "AudioCaptioner",
 ]

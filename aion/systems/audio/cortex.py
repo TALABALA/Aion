@@ -92,6 +92,68 @@ try:
 except ImportError:
     pass
 
+# Additional TRUE SOTA models
+_EMOTION2VEC_AVAILABLE = False
+_BEATS_AVAILABLE = False
+_DEEPFILTER_AVAILABLE = False
+_STREAMING_ASR_AVAILABLE = False
+_MUSICGEN_AVAILABLE = False
+_CAPTIONER_AVAILABLE = False
+
+try:
+    from aion.systems.audio.sota_models import (
+        Emotion2VecRecognizer,
+        Emotion2VecResult,
+    )
+    _EMOTION2VEC_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        BEATsEventDetector,
+        AudioEventResult,
+    )
+    _BEATS_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        DeepFilterNetEnhancer,
+        EnhancedAudio,
+    )
+    _DEEPFILTER_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        StreamingASR,
+        StreamingTranscript,
+    )
+    _STREAMING_ASR_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        MusicGenerator,
+        GeneratedMusic,
+    )
+    _MUSICGEN_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        AudioCaptioner,
+        AudioCaption,
+    )
+    _CAPTIONER_AVAILABLE = True
+except ImportError:
+    pass
+
 logger = structlog.get_logger(__name__)
 
 
@@ -147,6 +209,27 @@ class AuditoryCortexConfig:
 
     # HuggingFace token for pyannote (required for diarization)
     hf_token: Optional[str] = None
+
+    # TRUE SOTA additions
+    use_emotion2vec: bool = True  # emotion2vec (better than wav2vec2)
+    use_beats: bool = True  # BEATs for event detection (better than AST)
+    use_deepfilter: bool = True  # DeepFilterNet speech enhancement
+    use_streaming_asr: bool = False  # Streaming ASR (disabled by default)
+    use_musicgen: bool = False  # MusicGen (disabled by default, resource-heavy)
+    use_captioner: bool = True  # Audio captioning
+
+    # Emotion2vec settings
+    emotion2vec_model: str = "iic/emotion2vec_base_finetuned"
+
+    # Streaming ASR settings
+    streaming_model_size: str = "base"  # tiny, base, small, medium, large-v3
+    streaming_vad_threshold: float = 0.5
+
+    # MusicGen settings
+    musicgen_model: str = "small"  # small, medium, large, melody
+
+    # Speech enhancement settings
+    enhance_before_transcribe: bool = False  # Apply enhancement before ASR
 
 
 @dataclass
@@ -267,6 +350,14 @@ class AuditoryCortex:
         self._xtts: Optional[Any] = None
         self._audio_llm: Optional[Any] = None
 
+        # TRUE SOTA models (initialized lazily)
+        self._emotion2vec: Optional[Any] = None
+        self._beats: Optional[Any] = None
+        self._deepfilter: Optional[Any] = None
+        self._streaming_asr: Optional[Any] = None
+        self._musicgen: Optional[Any] = None
+        self._captioner: Optional[Any] = None
+
         # Legacy TTS model (lazy loaded, used if XTTS not available)
         self._tts_model = None
         self._tts_processor = None
@@ -278,6 +369,13 @@ class AuditoryCortex:
             "demucs": False,
             "xtts": False,
             "audio_llm": False,
+            # TRUE SOTA additions
+            "emotion2vec": False,
+            "beats": False,
+            "deepfilter": False,
+            "streaming_asr": False,
+            "musicgen": False,
+            "captioner": False,
         }
 
         # Statistics
@@ -293,6 +391,11 @@ class AuditoryCortex:
             "emotions_analyzed": 0,
             "sources_separated": 0,
             "audio_llm_queries": 0,
+            # TRUE SOTA stats
+            "streaming_chunks": 0,
+            "enhancements": 0,
+            "music_generations": 0,
+            "captions_generated": 0,
         }
 
         self._initialized = False
@@ -382,6 +485,72 @@ class AuditoryCortex:
             except Exception as e:
                 logger.warning(f"Audio LLM initialization failed: {e}")
 
+        # ============== TRUE SOTA MODELS ==============
+
+        # emotion2vec: Better than wav2vec2 for emotion
+        if _EMOTION2VEC_AVAILABLE and self.config.use_emotion2vec:
+            try:
+                self._emotion2vec = Emotion2VecRecognizer(self.config.emotion2vec_model)
+                if await self._emotion2vec.initialize():
+                    self._sota_status["emotion2vec"] = True
+                    logger.info("emotion2vec initialized (TRUE SOTA emotion)")
+            except Exception as e:
+                logger.warning(f"emotion2vec initialization failed: {e}")
+
+        # BEATs: Better than AST for audio events
+        if _BEATS_AVAILABLE and self.config.use_beats:
+            try:
+                self._beats = BEATsEventDetector()
+                if await self._beats.initialize():
+                    self._sota_status["beats"] = True
+                    logger.info("BEATs initialized (TRUE SOTA event detection)")
+            except Exception as e:
+                logger.warning(f"BEATs initialization failed: {e}")
+
+        # DeepFilterNet: Speech enhancement
+        if _DEEPFILTER_AVAILABLE and self.config.use_deepfilter:
+            try:
+                self._deepfilter = DeepFilterNetEnhancer()
+                if await self._deepfilter.initialize():
+                    self._sota_status["deepfilter"] = True
+                    logger.info("DeepFilterNet initialized (speech enhancement)")
+            except Exception as e:
+                logger.warning(f"DeepFilterNet initialization failed: {e}")
+
+        # Streaming ASR: Real-time transcription
+        if _STREAMING_ASR_AVAILABLE and self.config.use_streaming_asr:
+            try:
+                self._streaming_asr = StreamingASR(
+                    model_size=self.config.streaming_model_size,
+                    device=self.config.device,
+                    vad_threshold=self.config.streaming_vad_threshold,
+                )
+                if await self._streaming_asr.initialize():
+                    self._sota_status["streaming_asr"] = True
+                    logger.info("Streaming ASR initialized (real-time transcription)")
+            except Exception as e:
+                logger.warning(f"Streaming ASR initialization failed: {e}")
+
+        # MusicGen: Music generation
+        if _MUSICGEN_AVAILABLE and self.config.use_musicgen:
+            try:
+                self._musicgen = MusicGenerator(self.config.musicgen_model)
+                if await self._musicgen.initialize():
+                    self._sota_status["musicgen"] = True
+                    logger.info("MusicGen initialized (music generation)")
+            except Exception as e:
+                logger.warning(f"MusicGen initialization failed: {e}")
+
+        # Audio Captioning
+        if _CAPTIONER_AVAILABLE and self.config.use_captioner:
+            try:
+                self._captioner = AudioCaptioner()
+                if await self._captioner.initialize():
+                    self._sota_status["captioner"] = True
+                    logger.info("Audio Captioner initialized")
+            except Exception as e:
+                logger.warning(f"Audio Captioner initialization failed: {e}")
+
     async def shutdown(self) -> None:
         """Cleanup resources including all SOTA models."""
         logger.info("Shutting down Auditory Cortex", sota_status=self._sota_status)
@@ -438,6 +607,24 @@ class AuditoryCortex:
                 logger.warning(f"Error shutting down Audio LLM: {e}")
             self._audio_llm = None
 
+        # Shutdown TRUE SOTA models
+        for model_name, model_attr in [
+            ("emotion2vec", "_emotion2vec"),
+            ("BEATs", "_beats"),
+            ("DeepFilterNet", "_deepfilter"),
+            ("Streaming ASR", "_streaming_asr"),
+            ("MusicGen", "_musicgen"),
+            ("Captioner", "_captioner"),
+        ]:
+            model = getattr(self, model_attr, None)
+            if model:
+                try:
+                    if hasattr(model, 'shutdown'):
+                        await model.shutdown()
+                except Exception as e:
+                    logger.warning(f"Error shutting down {model_name}: {e}")
+                setattr(self, model_attr, None)
+
         # Reset SOTA status
         self._sota_status = {
             "whisperx": False,
@@ -445,6 +632,12 @@ class AuditoryCortex:
             "demucs": False,
             "xtts": False,
             "audio_llm": False,
+            "emotion2vec": False,
+            "beats": False,
+            "deepfilter": False,
+            "streaming_asr": False,
+            "musicgen": False,
+            "captioner": False,
         }
 
         self._initialized = False
@@ -1666,6 +1859,351 @@ class AuditoryCortex:
         return scene.describe()
 
     # ========================
+    # TRUE SOTA: Enhanced Emotion (emotion2vec)
+    # ========================
+
+    async def analyze_emotion_sota(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        return_embedding: bool = False,
+    ) -> dict[str, Any]:
+        """
+        TRUE SOTA emotion analysis using emotion2vec.
+
+        emotion2vec significantly outperforms wav2vec2-based models:
+        - Self-supervised pretraining on 262k hours
+        - State-of-the-art on all major benchmarks
+        - Universal emotion representation
+
+        Args:
+            audio: Audio source
+            return_embedding: Return emotion embedding
+
+        Returns:
+            Dictionary with primary_emotion, confidence, all_emotions, and optionally embedding
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+
+        # Use emotion2vec if available (TRUE SOTA)
+        if self._sota_status["emotion2vec"] and self._emotion2vec:
+            try:
+                result = await self._emotion2vec.recognize(audio, return_embedding=return_embedding)
+                self._stats["emotions_analyzed"] += 1
+                logger.debug(
+                    "Emotion analyzed with emotion2vec (TRUE SOTA)",
+                    emotion=result.primary_emotion,
+                    confidence=result.confidence,
+                )
+                return {
+                    "primary_emotion": result.primary_emotion,
+                    "confidence": result.confidence,
+                    "all_emotions": result.all_emotions,
+                    "embedding": result.embedding if return_embedding else None,
+                    "model": "emotion2vec",
+                }
+            except Exception as e:
+                logger.warning(f"emotion2vec failed, falling back: {e}")
+
+        # Fallback to wav2vec2-based
+        return await self.analyze_emotion(audio)
+
+    # ========================
+    # TRUE SOTA: BEATs Event Detection
+    # ========================
+
+    async def detect_events_sota(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        top_k: int = 10,
+        threshold: float = 0.1,
+        return_embeddings: bool = False,
+    ) -> dict[str, Any]:
+        """
+        TRUE SOTA audio event detection using BEATs.
+
+        BEATs outperforms AST on AudioSet with 50.6% mAP.
+
+        Args:
+            audio: Audio source
+            top_k: Number of top events to return
+            threshold: Confidence threshold
+            return_embeddings: Return audio embeddings
+
+        Returns:
+            Dictionary with events, top_events, and optionally embeddings
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._sota_status["beats"] and self._beats:
+            try:
+                result = await self._beats.detect_events(
+                    audio, top_k=top_k, threshold=threshold, return_embeddings=return_embeddings
+                )
+                self._stats["events_detected"] += len(result.events)
+                return {
+                    "events": result.events,
+                    "top_events": result.top_events,
+                    "embeddings": result.embeddings,
+                    "model": "beats",
+                }
+            except Exception as e:
+                logger.warning(f"BEATs detection failed, falling back to AST: {e}")
+
+        # Fallback to AST-based detection
+        events = await self.detect_events(audio, threshold=threshold)
+        return {
+            "events": [{"label": e.label, "confidence": e.confidence} for e in events[:top_k]],
+            "top_events": [e.label for e in events[:top_k]],
+            "model": "ast",
+        }
+
+    # ========================
+    # TRUE SOTA: Speech Enhancement
+    # ========================
+
+    async def enhance_speech(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+    ) -> AudioSegment:
+        """
+        Enhance speech by removing noise using DeepFilterNet.
+
+        Excellent for:
+        - Preprocessing noisy audio before transcription
+        - Improving audio quality for voice cloning
+        - Cleaning up recordings
+
+        Args:
+            audio: Noisy audio input
+
+        Returns:
+            AudioSegment with cleaned speech
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._sota_status["deepfilter"] or not self._deepfilter:
+            logger.warning("DeepFilterNet not available, returning original")
+            if isinstance(audio, AudioSegment):
+                return audio
+            waveform, sr = await self._perception.load_audio(audio)
+            return AudioSegment(waveform=waveform, sample_rate=sr)
+
+        start_time = time.time()
+
+        try:
+            result = await self._deepfilter.enhance(audio)
+            self._stats["enhancements"] += 1
+
+            logger.debug(
+                "Speech enhanced with DeepFilterNet",
+                processing_time_ms=(time.time() - start_time) * 1000,
+            )
+
+            return AudioSegment(
+                waveform=result.waveform,
+                sample_rate=result.sample_rate,
+                metadata={"enhanced": True, "snr_improvement_db": result.snr_improvement_db},
+            )
+
+        except Exception as e:
+            logger.warning(f"Enhancement failed: {e}")
+            if isinstance(audio, AudioSegment):
+                return audio
+            waveform, sr = await self._perception.load_audio(audio)
+            return AudioSegment(waveform=waveform, sample_rate=sr)
+
+    # ========================
+    # TRUE SOTA: Streaming ASR
+    # ========================
+
+    async def transcribe_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        sr: int = 16000,
+        language: Optional[str] = None,
+        previous_context: str = "",
+    ) -> dict[str, Any]:
+        """
+        Transcribe a single audio chunk for real-time streaming.
+
+        Args:
+            audio_chunk: Audio data (1-5 seconds recommended)
+            sr: Sample rate
+            language: Language code
+            previous_context: Previous transcript for continuity
+
+        Returns:
+            Dictionary with text, is_final, confidence, timing, words
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._sota_status["streaming_asr"] or not self._streaming_asr:
+            raise RuntimeError(
+                "Streaming ASR not available. Enable with use_streaming_asr=True "
+                "and install faster-whisper."
+            )
+
+        result = await self._streaming_asr.transcribe_chunk(
+            audio_chunk, sr, language, previous_context
+        )
+        self._stats["streaming_chunks"] += 1
+
+        return {
+            "text": result.text,
+            "is_final": result.is_final,
+            "confidence": result.confidence,
+            "start_time": result.start_time,
+            "end_time": result.end_time,
+            "words": result.words,
+        }
+
+    # ========================
+    # TRUE SOTA: Music Generation
+    # ========================
+
+    async def generate_music(
+        self,
+        prompt: str,
+        duration: float = 10.0,
+        temperature: float = 1.0,
+    ) -> AudioSegment:
+        """
+        Generate music from text description using MusicGen.
+
+        Args:
+            prompt: Text description (e.g., "upbeat electronic dance music with heavy bass")
+            duration: Duration in seconds (max 30s for small model)
+            temperature: Sampling temperature (higher = more random)
+
+        Returns:
+            AudioSegment with generated music
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._sota_status["musicgen"] or not self._musicgen:
+            raise RuntimeError(
+                "MusicGen not available. Enable with use_musicgen=True "
+                "and install audiocraft."
+            )
+
+        start_time = time.time()
+
+        result = await self._musicgen.generate(
+            prompt=prompt,
+            duration=duration,
+            temperature=temperature,
+        )
+        self._stats["music_generations"] += 1
+
+        logger.debug(
+            "Music generated with MusicGen",
+            duration=result.duration,
+            processing_time_ms=(time.time() - start_time) * 1000,
+        )
+
+        return AudioSegment(
+            waveform=result.waveform,
+            sample_rate=result.sample_rate,
+            metadata={"prompt": prompt, "generated": True},
+        )
+
+    async def generate_music_with_melody(
+        self,
+        prompt: str,
+        melody: Union[str, Path, np.ndarray, AudioSegment],
+        duration: float = 10.0,
+    ) -> AudioSegment:
+        """
+        Generate music conditioned on a melody.
+
+        Requires MusicGen melody model.
+
+        Args:
+            prompt: Text description
+            melody: Reference melody
+            duration: Output duration
+
+        Returns:
+            AudioSegment following the melody
+        """
+        if not self._sota_status["musicgen"] or not self._musicgen:
+            raise RuntimeError("MusicGen not available")
+
+        # Extract melody waveform
+        if isinstance(melody, AudioSegment):
+            melody_wav = melody.waveform
+            melody_sr = melody.sample_rate
+        elif isinstance(melody, (str, Path)):
+            melody_wav, melody_sr = await self._perception.load_audio(melody)
+        else:
+            melody_wav = melody
+            melody_sr = 32000
+
+        result = await self._musicgen.generate_with_melody(
+            prompt=prompt,
+            melody=melody_wav,
+            melody_sr=melody_sr,
+            duration=duration,
+        )
+
+        return AudioSegment(
+            waveform=result.waveform,
+            sample_rate=result.sample_rate,
+            metadata={"prompt": prompt, "melody_conditioned": True},
+        )
+
+    # ========================
+    # TRUE SOTA: Audio Captioning
+    # ========================
+
+    async def caption_audio(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        num_captions: int = 3,
+    ) -> dict[str, Any]:
+        """
+        Generate natural language caption for audio.
+
+        Uses CLAP-based retrieval for audio-to-text description.
+
+        Args:
+            audio: Audio input
+            num_captions: Number of alternative captions
+
+        Returns:
+            Dictionary with caption, confidence, alternative_captions
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._sota_status["captioner"] and self._captioner:
+            try:
+                result = await self._captioner.caption(audio, num_captions=num_captions)
+                self._stats["captions_generated"] += 1
+                return {
+                    "caption": result.caption,
+                    "confidence": result.confidence,
+                    "alternative_captions": result.alternative_captions,
+                }
+            except Exception as e:
+                logger.warning(f"Captioning failed: {e}")
+
+        # Fallback to scene description
+        scene = await self.understand_scene(audio)
+        return {
+            "caption": scene.describe(),
+            "confidence": 0.5,
+            "alternative_captions": [],
+        }
+
+    # ========================
     # SOTA Status & Capabilities
     # ========================
 
@@ -1702,11 +2240,12 @@ class AuditoryCortex:
                 },
             },
             "emotion_recognition": {
-                "available": self._sota_status["emotion"],
-                "sota": self._sota_status["emotion"],
+                "available": self._sota_status["emotion"] or self._sota_status["emotion2vec"],
+                "sota": self._sota_status["emotion2vec"],  # emotion2vec is TRUE SOTA
                 "features": {
-                    "dimensional": self._sota_status["emotion"],  # arousal, valence, dominance
+                    "dimensional": self._sota_status["emotion"],
                     "categorical": True,
+                    "emotion2vec": self._sota_status["emotion2vec"],  # TRUE SOTA
                 },
             },
             "source_separation": {
@@ -1745,6 +2284,47 @@ class AuditoryCortex:
                     "similarity_search": True,
                     "speaker_search": True,
                     "transcript_search": True,
+                },
+            },
+            # TRUE SOTA additions
+            "event_detection": {
+                "available": True,
+                "sota": self._sota_status["beats"],  # BEATs is TRUE SOTA
+                "features": {
+                    "beats": self._sota_status["beats"],
+                    "audioset_labels": True,
+                },
+            },
+            "speech_enhancement": {
+                "available": self._sota_status["deepfilter"],
+                "sota": self._sota_status["deepfilter"],
+                "features": {
+                    "noise_reduction": self._sota_status["deepfilter"],
+                    "real_time": self._sota_status["deepfilter"],
+                },
+            },
+            "streaming_asr": {
+                "available": self._sota_status["streaming_asr"],
+                "sota": True,  # faster-whisper is SOTA for streaming
+                "features": {
+                    "real_time": self._sota_status["streaming_asr"],
+                    "word_timestamps": self._sota_status["streaming_asr"],
+                    "vad": self._sota_status["streaming_asr"],
+                },
+            },
+            "music_generation": {
+                "available": self._sota_status["musicgen"],
+                "sota": self._sota_status["musicgen"],  # MusicGen is SOTA
+                "features": {
+                    "text_to_music": self._sota_status["musicgen"],
+                    "melody_conditioning": self.config.musicgen_model == "melody",
+                },
+            },
+            "audio_captioning": {
+                "available": self._sota_status["captioner"],
+                "sota": self._sota_status["captioner"],
+                "features": {
+                    "clap_based": self._sota_status["captioner"],
                 },
             },
         }

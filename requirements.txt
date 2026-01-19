@@ -90,3 +90,29 @@ speechbrain>=1.0.0
 
 # Audio Language Models (Qwen-Audio requires special install)
 # See: https://github.com/QwenLM/Qwen-Audio
+
+# ==================== TRUE SOTA (Optional) ====================
+# These are the absolute state-of-the-art models:
+
+# emotion2vec: TRUE SOTA emotion recognition (Alibaba)
+# Significantly outperforms wav2vec2-based models
+# pip install funasr
+# funasr>=1.0.0
+
+# BEATs: TRUE SOTA audio event detection (Microsoft)
+# 50.6% mAP on AudioSet, outperforms AST
+# Available via transformers (microsoft/beats-iter3)
+
+# DeepFilterNet: SOTA speech enhancement/noise reduction
+# Real-time noise suppression with minimal speech distortion
+# pip install deepfilternet
+# deepfilternet>=0.5.0
+
+# MusicGen: SOTA music generation (Meta)
+# Text-to-music and melody-conditioned generation
+# pip install audiocraft
+# audiocraft>=1.2.0
+
+# Silero VAD: Fast and accurate voice activity detection
+# Used by streaming ASR for better segmentation
+# torch.hub.load('snakers4/silero-vad', 'silero_vad')
