@@ -101,6 +101,24 @@ class VisionConfig(BaseModel):
     scene_graph_enabled: bool = True
 
 
+class AudioConfig(BaseModel):
+    """Configuration for the Auditory Cortex System."""
+    enabled: bool = True
+    device: str = "auto"  # "cpu", "cuda", "mps", "auto"
+    whisper_model: str = "openai/whisper-large-v3"
+    speaker_model: str = "speechbrain/spkrec-ecapa-voxceleb"
+    event_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
+    clap_model: str = "laion/larger_clap_general"
+    tts_model: str = "tts_models/en/ljspeech/tacotron2-DDC"
+    sample_rate: int = 16000
+    enable_audio_memory: bool = True
+    enable_diarization: bool = True
+    enable_tts: bool = True
+    max_audio_duration: float = 600.0  # 10 minutes max
+    attention_threshold: float = 0.5
+    memory_index_path: Optional[Path] = None
+
+
 class SecurityConfig(BaseModel):
     """Configuration for the Security System."""
     require_approval_for_high_risk: bool = True
@@ -151,6 +169,7 @@ class AIONConfig(BaseSettings):
     tools: ToolConfig = Field(default_factory=ToolConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 

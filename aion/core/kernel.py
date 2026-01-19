@@ -93,6 +93,7 @@ class AIONKernel:
         self._tool_orchestrator = None
         self._evolution_engine = None
         self._visual_cortex = None
+        self._audio_cortex = None
 
         # State
         self._status = SystemStatus.INITIALIZING
@@ -180,6 +181,7 @@ class AIONKernel:
         from aion.systems.tools import ToolOrchestrator
         from aion.systems.evolution import SelfImprovementEngine
         from aion.systems.vision import VisualCortex
+        from aion.systems.audio import AuditoryCortex
 
         # Initialize Planning Graph
         try:
@@ -243,6 +245,24 @@ class AIONKernel:
             logger.warning("Visual cortex initialization failed", error=str(e))
             self._update_health("vision", SystemStatus.ERROR, str(e))
 
+        # Initialize Auditory Cortex
+        if self.config.audio.enabled:
+            try:
+                self._audio_cortex = AuditoryCortex(
+                    enable_memory=self.config.audio.enable_audio_memory,
+                    device=self.config.audio.device,
+                    whisper_model=self.config.audio.whisper_model,
+                    enable_diarization=self.config.audio.enable_diarization,
+                    enable_tts=self.config.audio.enable_tts,
+                    max_audio_duration=self.config.audio.max_audio_duration,
+                    sample_rate=self.config.audio.sample_rate,
+                )
+                await self._audio_cortex.initialize()
+                self._update_health("audio", SystemStatus.READY)
+            except Exception as e:
+                logger.warning("Auditory cortex initialization failed", error=str(e))
+                self._update_health("audio", SystemStatus.ERROR, str(e))
+
     def _update_health(
         self,
         system: str,
@@ -283,6 +303,8 @@ class AIONKernel:
             await self._evolution_engine.shutdown()
         if self._visual_cortex:
             await self._visual_cortex.shutdown()
+        if self._audio_cortex:
+            await self._audio_cortex.shutdown()
 
         logger.info("AION Kernel shutdown complete")
 
@@ -431,6 +453,7 @@ Available actions:
 - reason: Perform reasoning/analysis
 - respond: Generate a response
 - vision: Process visual input
+- audio: Process audio input
 
 Output a JSON array of steps, each with:
 - type: action type
@@ -484,6 +507,13 @@ Output a JSON array of steps, each with:
             elif step_type == "vision" and self._visual_cortex:
                 result = await self._visual_cortex.process(
                     image_path=step.get("image", ""),
+                    query=step.get("content", ""),
+                )
+                results.append(result)
+
+            elif step_type == "audio" and self._audio_cortex:
+                result = await self._audio_cortex.process(
+                    audio=step.get("audio", ""),
                     query=step.get("content", ""),
                 )
                 results.append(result)
@@ -573,3 +603,8 @@ Output a JSON array of steps, each with:
     def vision(self):
         """Get the visual cortex."""
         return self._visual_cortex
+
+    @property
+    def audio(self):
+        """Get the auditory cortex."""
+        return self._audio_cortex
