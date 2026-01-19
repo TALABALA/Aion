@@ -2,12 +2,15 @@
 AION Auditory Cortex
 
 Complete audio perception and understanding system providing:
-- Speech recognition with speaker diarization
+- Speech recognition with speaker diarization (Whisper-X when available)
 - Audio event detection and scene understanding
 - Speaker identification and verification
-- Text-to-speech generation with voice cloning
+- Text-to-speech generation with voice cloning (XTTS-v2 when available)
 - Audio memory and retrieval
 - Audio-based reasoning and QA
+- Speech emotion recognition (wav2vec2-emotion when available)
+- Audio source separation (Demucs when available)
+- Audio language model integration (Qwen-Audio when available)
 """
 
 from __future__ import annotations
@@ -39,6 +42,55 @@ from aion.systems.audio.models import (
 )
 from aion.systems.audio.perception import AudioPerception, PerceptionConfig
 from aion.systems.audio.memory import AudioMemory, AudioSearchResult
+
+# Try to import SOTA models
+_WHISPERX_AVAILABLE = False
+_EMOTION_AVAILABLE = False
+_DEMUCS_AVAILABLE = False
+_XTTS_AVAILABLE = False
+_AUDIO_LLM_AVAILABLE = False
+
+try:
+    from aion.systems.audio.sota_models import (
+        WhisperXTranscriber,
+        WhisperXConfig,
+    )
+    _WHISPERX_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        SpeechEmotionRecognizer,
+        EmotionResult,
+    )
+    _EMOTION_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        AudioSourceSeparator,
+        SeparatedSources,
+    )
+    _DEMUCS_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        XTTSSynthesizer,
+        XTTSConfig,
+    )
+    _XTTS_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import AudioLanguageModel
+    _AUDIO_LLM_AVAILABLE = True
+except ImportError:
+    pass
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +126,27 @@ class AuditoryCortexConfig:
     # Analysis settings
     enable_music_analysis: bool = True
     event_threshold: float = 0.3
+
+    # SOTA model settings (auto-enabled when packages available)
+    use_whisperx: bool = True  # Use Whisper-X for better alignment
+    use_emotion_recognition: bool = True  # Use wav2vec2 emotion model
+    use_source_separation: bool = True  # Use Demucs for source separation
+    use_xtts: bool = True  # Use XTTS-v2 for high-quality TTS
+    use_audio_llm: bool = True  # Use Qwen-Audio for direct understanding
+
+    # Whisper-X specific settings
+    whisperx_compute_type: str = "float16"  # "float16", "int8", "float32"
+    whisperx_batch_size: int = 16
+
+    # XTTS specific settings
+    xtts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
+
+    # Source separation settings
+    demucs_model: str = "htdemucs"
+    separate_before_transcribe: bool = True  # Separate vocals before ASR
+
+    # HuggingFace token for pyannote (required for diarization)
+    hf_token: Optional[str] = None
 
 
 @dataclass
@@ -163,7 +236,7 @@ class AuditoryCortex:
 
         self.config = config
 
-        # Initialize perception
+        # Initialize perception (fallback for non-SOTA)
         perception_config = PerceptionConfig(
             whisper_model=config.whisper_model,
             enable_diarization=config.enable_diarization,
@@ -187,9 +260,25 @@ class AuditoryCortex:
                 index_path=config.memory_index_path,
             )
 
-        # TTS model (lazy loaded)
+        # SOTA models (initialized lazily)
+        self._whisperx: Optional[Any] = None
+        self._emotion_recognizer: Optional[Any] = None
+        self._source_separator: Optional[Any] = None
+        self._xtts: Optional[Any] = None
+        self._audio_llm: Optional[Any] = None
+
+        # Legacy TTS model (lazy loaded, used if XTTS not available)
         self._tts_model = None
         self._tts_processor = None
+
+        # Track which SOTA features are active
+        self._sota_status = {
+            "whisperx": False,
+            "emotion": False,
+            "demucs": False,
+            "xtts": False,
+            "audio_llm": False,
+        }
 
         # Statistics
         self._stats = {
@@ -201,6 +290,9 @@ class AuditoryCortex:
             "memories_stored": 0,
             "memories_recalled": 0,
             "total_audio_processed_seconds": 0.0,
+            "emotions_analyzed": 0,
+            "sources_separated": 0,
+            "audio_llm_queries": 0,
         }
 
         self._initialized = False
@@ -212,28 +304,148 @@ class AuditoryCortex:
 
         logger.info("Initializing Auditory Cortex")
 
-        # Initialize perception
+        # Initialize base perception
         await self._perception.initialize()
 
         # Initialize memory
         if self._memory:
             await self._memory.initialize()
 
+        # Initialize SOTA models if available and enabled
+        await self._initialize_sota_models()
+
         self._initialized = True
-        logger.info("Auditory Cortex initialized")
+        logger.info("Auditory Cortex initialized", sota_status=self._sota_status)
+
+    async def _initialize_sota_models(self) -> None:
+        """Initialize SOTA models when available."""
+
+        # Whisper-X: SOTA transcription with alignment
+        if _WHISPERX_AVAILABLE and self.config.use_whisperx:
+            try:
+                whisperx_config = WhisperXConfig(
+                    model_size=self.config.whisper_model.split("/")[-1] if "/" in self.config.whisper_model else "large-v3",
+                    device=self.config.device,
+                    compute_type=self.config.whisperx_compute_type,
+                    batch_size=self.config.whisperx_batch_size,
+                    enable_diarization=self.config.enable_diarization,
+                    hf_token=self.config.hf_token,
+                )
+                self._whisperx = WhisperXTranscriber(whisperx_config)
+                if await self._whisperx.initialize():
+                    self._sota_status["whisperx"] = True
+                    logger.info("Whisper-X initialized (SOTA transcription)")
+            except Exception as e:
+                logger.warning(f"Whisper-X initialization failed: {e}")
+
+        # Emotion Recognition: wav2vec2-based
+        if _EMOTION_AVAILABLE and self.config.use_emotion_recognition:
+            try:
+                self._emotion_recognizer = SpeechEmotionRecognizer()
+                if await self._emotion_recognizer.initialize():
+                    self._sota_status["emotion"] = True
+                    logger.info("Speech emotion recognizer initialized")
+            except Exception as e:
+                logger.warning(f"Emotion recognition initialization failed: {e}")
+
+        # Demucs: Source separation
+        if _DEMUCS_AVAILABLE and self.config.use_source_separation:
+            try:
+                self._source_separator = AudioSourceSeparator(self.config.demucs_model)
+                if await self._source_separator.initialize():
+                    self._sota_status["demucs"] = True
+                    logger.info("Demucs source separator initialized")
+            except Exception as e:
+                logger.warning(f"Demucs initialization failed: {e}")
+
+        # XTTS: High-quality TTS with voice cloning
+        if _XTTS_AVAILABLE and self.config.use_xtts and self.config.enable_tts:
+            try:
+                xtts_config = XTTSConfig(
+                    model_name=self.config.xtts_model,
+                    device=self.config.device,
+                )
+                self._xtts = XTTSSynthesizer(xtts_config)
+                if await self._xtts.initialize():
+                    self._sota_status["xtts"] = True
+                    logger.info("XTTS-v2 initialized (SOTA TTS with voice cloning)")
+            except Exception as e:
+                logger.warning(f"XTTS initialization failed: {e}")
+
+        # Audio LLM: Direct audio understanding
+        if _AUDIO_LLM_AVAILABLE and self.config.use_audio_llm:
+            try:
+                self._audio_llm = AudioLanguageModel()
+                if await self._audio_llm.initialize():
+                    self._sota_status["audio_llm"] = True
+                    logger.info("Audio LLM initialized (direct audio understanding)")
+            except Exception as e:
+                logger.warning(f"Audio LLM initialization failed: {e}")
 
     async def shutdown(self) -> None:
-        """Cleanup resources."""
-        logger.info("Shutting down Auditory Cortex")
+        """Cleanup resources including all SOTA models."""
+        logger.info("Shutting down Auditory Cortex", sota_status=self._sota_status)
 
+        # Shutdown base perception
         await self._perception.shutdown()
 
+        # Shutdown memory
         if self._memory:
             await self._memory.shutdown()
 
-        # Clear TTS model
+        # Clear legacy TTS model
         self._tts_model = None
         self._tts_processor = None
+
+        # Shutdown SOTA models
+        if self._whisperx:
+            try:
+                if hasattr(self._whisperx, 'shutdown'):
+                    await self._whisperx.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down Whisper-X: {e}")
+            self._whisperx = None
+
+        if self._emotion_recognizer:
+            try:
+                if hasattr(self._emotion_recognizer, 'shutdown'):
+                    await self._emotion_recognizer.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down emotion recognizer: {e}")
+            self._emotion_recognizer = None
+
+        if self._source_separator:
+            try:
+                if hasattr(self._source_separator, 'shutdown'):
+                    await self._source_separator.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down source separator: {e}")
+            self._source_separator = None
+
+        if self._xtts:
+            try:
+                if hasattr(self._xtts, 'shutdown'):
+                    await self._xtts.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down XTTS: {e}")
+            self._xtts = None
+
+        if self._audio_llm:
+            try:
+                if hasattr(self._audio_llm, 'shutdown'):
+                    await self._audio_llm.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down Audio LLM: {e}")
+            self._audio_llm = None
+
+        # Reset SOTA status
+        self._sota_status = {
+            "whisperx": False,
+            "emotion": False,
+            "demucs": False,
+            "xtts": False,
+            "audio_llm": False,
+        }
 
         self._initialized = False
         logger.info("Auditory Cortex shutdown complete")
@@ -248,15 +460,23 @@ class AuditoryCortex:
         language: Optional[str] = None,
         enable_diarization: bool = True,
         enable_timestamps: bool = True,
+        separate_vocals: Optional[bool] = None,
     ) -> Transcript:
         """
         Transcribe speech to text with optional speaker diarization.
+
+        Uses Whisper-X when available for:
+        - 16x faster batched inference
+        - Phoneme-level forced alignment
+        - Accurate word timestamps
 
         Args:
             audio: Audio source (path, bytes, numpy array, or AudioSegment)
             language: Language code (auto-detect if None)
             enable_diarization: Perform speaker diarization
             enable_timestamps: Include word-level timestamps
+            separate_vocals: Extract vocals before transcribing (better for noisy audio)
+                           Defaults to config.separate_before_transcribe if Demucs available
 
         Returns:
             Transcript with segments, speakers, and timing
@@ -266,20 +486,63 @@ class AuditoryCortex:
 
         start_time = time.time()
 
-        # Transcribe
-        transcript = await self._perception.transcribe(
-            audio,
-            language=language,
-            return_timestamps=enable_timestamps,
-        )
+        # Optionally separate vocals first for cleaner transcription
+        audio_to_transcribe = audio
+        if separate_vocals is None:
+            separate_vocals = self.config.separate_before_transcribe and self._sota_status["demucs"]
 
-        # Diarize if requested
-        if enable_diarization and self.config.enable_diarization:
-            speakers = await self._perception.diarize(audio)
-            if speakers:
-                transcript = await self._perception.align_transcript_with_speakers(
-                    transcript, speakers
+        if separate_vocals and self._sota_status["demucs"] and self._source_separator:
+            try:
+                logger.debug("Separating vocals before transcription")
+                separated = await self._source_separator.separate(audio)
+                if separated.vocals is not None:
+                    audio_to_transcribe = AudioSegment(
+                        waveform=separated.vocals,
+                        sample_rate=separated.sample_rate,
+                        channels=1,
+                    )
+                    self._stats["sources_separated"] += 1
+            except Exception as e:
+                logger.warning(f"Source separation failed, using original audio: {e}")
+
+        # Use Whisper-X if available (SOTA transcription)
+        if self._sota_status["whisperx"] and self._whisperx:
+            try:
+                transcript = await self._whisperx.transcribe(
+                    audio_to_transcribe,
+                    language=language,
+                    enable_diarization=enable_diarization and self.config.enable_diarization,
                 )
+                logger.debug("Used Whisper-X for transcription (SOTA)")
+            except Exception as e:
+                logger.warning(f"Whisper-X failed, falling back to base Whisper: {e}")
+                # Fallback to base perception
+                transcript = await self._perception.transcribe(
+                    audio_to_transcribe,
+                    language=language,
+                    return_timestamps=enable_timestamps,
+                )
+                if enable_diarization and self.config.enable_diarization:
+                    speakers = await self._perception.diarize(audio_to_transcribe)
+                    if speakers:
+                        transcript = await self._perception.align_transcript_with_speakers(
+                            transcript, speakers
+                        )
+        else:
+            # Base perception transcription
+            transcript = await self._perception.transcribe(
+                audio_to_transcribe,
+                language=language,
+                return_timestamps=enable_timestamps,
+            )
+
+            # Diarize if requested
+            if enable_diarization and self.config.enable_diarization:
+                speakers = await self._perception.diarize(audio_to_transcribe)
+                if speakers:
+                    transcript = await self._perception.align_transcript_with_speakers(
+                        transcript, speakers
+                    )
 
         self._stats["transcriptions"] += 1
         self._stats["total_audio_processed_seconds"] += transcript.duration
@@ -289,6 +552,8 @@ class AuditoryCortex:
             duration=transcript.duration,
             speakers=len(transcript.speakers),
             processing_time_ms=(time.time() - start_time) * 1000,
+            used_whisperx=self._sota_status["whisperx"],
+            used_source_separation=separate_vocals and self._sota_status["demucs"],
         )
 
         return transcript
@@ -603,15 +868,23 @@ class AuditoryCortex:
         voice: Optional[str] = None,
         language: str = "en",
         speed: float = 1.0,
+        emotion: Optional[str] = None,
     ) -> AudioSegment:
         """
         Generate speech from text.
 
+        Uses XTTS-v2 when available for:
+        - High-quality neural TTS
+        - 17 language support
+        - Emotional control
+        - Natural prosody
+
         Args:
             text: Text to synthesize
             voice: Voice preset or speaker ID
-            language: Language code
+            language: Language code (en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar, zh, ja, hu, ko, hi)
             speed: Speech speed (0.5-2.0)
+            emotion: Emotional style (happy, sad, angry, fearful, neutral) - XTTS only
 
         Returns:
             AudioSegment with synthesized speech
@@ -626,6 +899,44 @@ class AuditoryCortex:
                 metadata={"error": "TTS disabled"},
             )
 
+        start_time = time.time()
+
+        # Use XTTS if available (SOTA TTS)
+        if self._sota_status["xtts"] and self._xtts:
+            try:
+                result = await self._xtts.synthesize(
+                    text=text,
+                    language=language,
+                    speaker=voice,
+                    speed=speed,
+                    emotion=emotion,
+                )
+                audio = AudioSegment(
+                    waveform=result.waveform,
+                    sample_rate=result.sample_rate,
+                    channels=1,
+                    start_time=0.0,
+                    end_time=len(result.waveform) / result.sample_rate,
+                    metadata={
+                        "text": text,
+                        "voice": voice,
+                        "language": language,
+                        "speed": speed,
+                        "emotion": emotion,
+                        "engine": "xtts_v2",
+                    },
+                )
+                self._stats["speeches_synthesized"] += 1
+                logger.debug(
+                    "Speech synthesized with XTTS-v2",
+                    duration=audio.duration,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+                return audio
+            except Exception as e:
+                logger.warning(f"XTTS synthesis failed, falling back to Bark: {e}")
+
+        # Fallback to Bark TTS
         await self._ensure_tts_loaded()
 
         if self._tts_model is None:
@@ -634,8 +945,6 @@ class AuditoryCortex:
                 sample_rate=self.config.target_sample_rate,
                 metadata={"error": "TTS model not available"},
             )
-
-        start_time = time.time()
 
         loop = asyncio.get_event_loop()
         waveform, sr = await loop.run_in_executor(
@@ -654,13 +963,14 @@ class AuditoryCortex:
                 "voice": voice,
                 "language": language,
                 "speed": speed,
+                "engine": "bark",
             },
         )
 
         self._stats["speeches_synthesized"] += 1
 
         logger.debug(
-            "Speech synthesized",
+            "Speech synthesized with Bark",
             duration=audio.duration,
             processing_time_ms=(time.time() - start_time) * 1000,
         )
@@ -711,24 +1021,78 @@ class AuditoryCortex:
         self,
         reference_audio: Union[str, Path, np.ndarray, AudioSegment],
         text: str,
+        language: str = "en",
+        emotion: Optional[str] = None,
     ) -> AudioSegment:
         """
         Generate speech in a cloned voice.
 
+        Uses XTTS-v2 for high-quality voice cloning from just 3 seconds of audio.
+
         Args:
-            reference_audio: Reference audio for voice cloning
+            reference_audio: Reference audio for voice cloning (3+ seconds recommended)
             text: Text to synthesize
+            language: Target language code
+            emotion: Emotional style (happy, sad, angry, fearful, neutral)
 
         Returns:
-            AudioSegment with synthesized speech
+            AudioSegment with synthesized speech in the cloned voice
         """
         if not self._initialized:
             await self.initialize()
 
-        # For now, use standard synthesis
-        # Full voice cloning would require a dedicated model like XTTS
-        logger.warning("Voice cloning not fully implemented, using standard synthesis")
-        return await self.synthesize(text)
+        start_time = time.time()
+
+        # Use XTTS for voice cloning (requires XTTS to be available)
+        if self._sota_status["xtts"] and self._xtts:
+            try:
+                # Load reference audio if needed
+                if isinstance(reference_audio, (str, Path)):
+                    ref_waveform, ref_sr = await self._perception.load_audio(reference_audio)
+                elif isinstance(reference_audio, AudioSegment):
+                    ref_waveform = reference_audio.waveform
+                    ref_sr = reference_audio.sample_rate
+                else:
+                    ref_waveform = reference_audio
+                    ref_sr = self.config.target_sample_rate
+
+                result = await self._xtts.clone_voice(
+                    text=text,
+                    reference_audio=ref_waveform,
+                    reference_sr=ref_sr,
+                    language=language,
+                    emotion=emotion,
+                )
+
+                audio = AudioSegment(
+                    waveform=result.waveform,
+                    sample_rate=result.sample_rate,
+                    channels=1,
+                    start_time=0.0,
+                    end_time=len(result.waveform) / result.sample_rate,
+                    metadata={
+                        "text": text,
+                        "language": language,
+                        "emotion": emotion,
+                        "engine": "xtts_v2_clone",
+                        "voice_cloning": True,
+                    },
+                )
+
+                self._stats["speeches_synthesized"] += 1
+                logger.debug(
+                    "Voice cloned with XTTS-v2",
+                    duration=audio.duration,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+                return audio
+
+            except Exception as e:
+                logger.warning(f"XTTS voice cloning failed: {e}")
+
+        # Fallback to standard synthesis without cloning
+        logger.warning("Voice cloning requires XTTS-v2, using standard synthesis")
+        return await self.synthesize(text, language=language)
 
     # ========================
     # Memory Operations
@@ -1070,6 +1434,322 @@ class AuditoryCortex:
         return await self._perception.analyze_music(audio)
 
     # ========================
+    # SOTA: Emotion Recognition
+    # ========================
+
+    async def analyze_emotion(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+    ) -> dict[str, Any]:
+        """
+        Analyze emotional content in speech.
+
+        Uses wav2vec2-large-robust emotion model for dimensional emotion
+        analysis (arousal, valence, dominance) mapped to categorical emotions.
+
+        Args:
+            audio: Audio source containing speech
+
+        Returns:
+            Dictionary with emotion analysis:
+            - primary_emotion: str (angry, happy, sad, neutral, fearful, disgusted, surprised)
+            - confidence: float
+            - arousal: float (-1 to 1, low to high energy)
+            - valence: float (-1 to 1, negative to positive)
+            - dominance: float (-1 to 1, submissive to dominant)
+            - all_emotions: dict[str, float] (probability distribution)
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+
+        if self._sota_status["emotion"] and self._emotion_recognizer:
+            try:
+                result = await self._emotion_recognizer.analyze(audio)
+                self._stats["emotions_analyzed"] += 1
+
+                logger.debug(
+                    "Emotion analysis complete",
+                    primary_emotion=result.primary_emotion,
+                    confidence=result.confidence,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+
+                return {
+                    "primary_emotion": result.primary_emotion,
+                    "confidence": result.confidence,
+                    "arousal": result.arousal,
+                    "valence": result.valence,
+                    "dominance": result.dominance,
+                    "all_emotions": result.all_emotions,
+                }
+            except Exception as e:
+                logger.warning(f"Emotion analysis failed: {e}")
+
+        # Fallback to basic heuristic-based emotion detection
+        scene = await self.understand_scene(audio)
+        return {
+            "primary_emotion": scene.emotional_tone.value if scene.emotional_tone else "neutral",
+            "confidence": 0.5,
+            "arousal": 0.0,
+            "valence": 0.0,
+            "dominance": 0.0,
+            "all_emotions": {},
+            "note": "Basic heuristic analysis - install wav2vec2-emotion for SOTA results",
+        }
+
+    # ========================
+    # SOTA: Source Separation
+    # ========================
+
+    async def separate_sources(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        model: Optional[str] = None,
+    ) -> dict[str, AudioSegment]:
+        """
+        Separate audio into component sources using Demucs.
+
+        Separates audio into:
+        - vocals: Human voice
+        - drums: Percussion instruments
+        - bass: Bass instruments
+        - other: Other instruments
+
+        Args:
+            audio: Audio source to separate
+            model: Demucs model to use (default: htdemucs)
+
+        Returns:
+            Dictionary of separated AudioSegments:
+            - "vocals": Isolated voice track
+            - "drums": Isolated drums track
+            - "bass": Isolated bass track
+            - "other": Other instruments track
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._sota_status["demucs"] or not self._source_separator:
+            raise RuntimeError(
+                "Source separation requires Demucs. Install with: pip install demucs"
+            )
+
+        start_time = time.time()
+
+        try:
+            separated = await self._source_separator.separate(audio, model=model)
+            self._stats["sources_separated"] += 1
+
+            result = {}
+            for source_name in ["vocals", "drums", "bass", "other"]:
+                waveform = getattr(separated, source_name, None)
+                if waveform is not None:
+                    result[source_name] = AudioSegment(
+                        waveform=waveform,
+                        sample_rate=separated.sample_rate,
+                        channels=1,
+                        start_time=0.0,
+                        end_time=len(waveform) / separated.sample_rate,
+                        metadata={"source": source_name, "model": separated.model_used},
+                    )
+
+            logger.debug(
+                "Source separation complete",
+                sources=list(result.keys()),
+                processing_time_ms=(time.time() - start_time) * 1000,
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Source separation failed: {e}")
+            raise
+
+    async def extract_vocals(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+    ) -> AudioSegment:
+        """
+        Extract vocals from audio (shortcut for separate_sources).
+
+        Useful for:
+        - Improving transcription quality in noisy audio
+        - Karaoke creation
+        - Voice isolation
+
+        Args:
+            audio: Audio source
+
+        Returns:
+            AudioSegment containing only the vocal track
+        """
+        sources = await self.separate_sources(audio)
+        return sources.get("vocals", AudioSegment(sample_rate=self.config.target_sample_rate))
+
+    # ========================
+    # SOTA: Audio Language Model
+    # ========================
+
+    async def query_audio(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        query: str,
+    ) -> str:
+        """
+        Query audio content directly using Audio LLM (Qwen-Audio).
+
+        Enables direct audio understanding without ASR bottleneck:
+        - "What sounds are in this audio?"
+        - "Describe the music"
+        - "What is the speaker talking about?"
+        - "Is this speech or music?"
+        - "What emotion is expressed?"
+
+        Args:
+            audio: Audio source
+            query: Natural language question about the audio
+
+        Returns:
+            Natural language answer from the Audio LLM
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+
+        if self._sota_status["audio_llm"] and self._audio_llm:
+            try:
+                answer = await self._audio_llm.query(audio, query)
+                self._stats["audio_llm_queries"] += 1
+
+                logger.debug(
+                    "Audio LLM query complete",
+                    query=query[:50],
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+
+                return answer
+
+            except Exception as e:
+                logger.warning(f"Audio LLM query failed: {e}")
+
+        # Fallback to rule-based answer_question
+        logger.info("Audio LLM not available, using rule-based QA")
+        return await self.answer_question(audio, query)
+
+    async def describe_audio(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+    ) -> str:
+        """
+        Generate a natural language description of audio content.
+
+        Uses Audio LLM when available for rich, contextual descriptions.
+
+        Args:
+            audio: Audio source
+
+        Returns:
+            Natural language description of the audio
+        """
+        if self._sota_status["audio_llm"] and self._audio_llm:
+            return await self.query_audio(
+                audio,
+                "Provide a detailed description of this audio, including any speech, "
+                "music, environmental sounds, and emotional qualities you detect."
+            )
+
+        # Fallback to scene description
+        scene = await self.understand_scene(audio)
+        return scene.describe()
+
+    # ========================
+    # SOTA Status & Capabilities
+    # ========================
+
+    def get_sota_status(self) -> dict[str, bool]:
+        """
+        Get the availability status of SOTA features.
+
+        Returns:
+            Dictionary mapping feature names to availability:
+            - whisperx: SOTA transcription with forced alignment
+            - emotion: wav2vec2-based emotion recognition
+            - demucs: Source separation
+            - xtts: High-quality TTS with voice cloning
+            - audio_llm: Direct audio understanding
+        """
+        return dict(self._sota_status)
+
+    def get_capabilities(self) -> dict[str, Any]:
+        """
+        Get a summary of all available capabilities.
+
+        Returns:
+            Dictionary of capability categories and their status
+        """
+        return {
+            "transcription": {
+                "available": True,
+                "sota": self._sota_status["whisperx"],
+                "features": {
+                    "diarization": self.config.enable_diarization,
+                    "word_timestamps": True,
+                    "forced_alignment": self._sota_status["whisperx"],
+                    "batched_inference": self._sota_status["whisperx"],
+                },
+            },
+            "emotion_recognition": {
+                "available": self._sota_status["emotion"],
+                "sota": self._sota_status["emotion"],
+                "features": {
+                    "dimensional": self._sota_status["emotion"],  # arousal, valence, dominance
+                    "categorical": True,
+                },
+            },
+            "source_separation": {
+                "available": self._sota_status["demucs"],
+                "sota": self._sota_status["demucs"],
+                "features": {
+                    "vocals": self._sota_status["demucs"],
+                    "drums": self._sota_status["demucs"],
+                    "bass": self._sota_status["demucs"],
+                    "other": self._sota_status["demucs"],
+                },
+            },
+            "text_to_speech": {
+                "available": self.config.enable_tts,
+                "sota": self._sota_status["xtts"],
+                "features": {
+                    "voice_cloning": self._sota_status["xtts"],
+                    "multilingual": self._sota_status["xtts"],
+                    "emotional_control": self._sota_status["xtts"],
+                    "languages": 17 if self._sota_status["xtts"] else 1,
+                },
+            },
+            "audio_understanding": {
+                "available": True,
+                "sota": self._sota_status["audio_llm"],
+                "features": {
+                    "direct_audio_query": self._sota_status["audio_llm"],
+                    "scene_understanding": True,
+                    "event_detection": True,
+                    "music_analysis": self.config.enable_music_analysis,
+                },
+            },
+            "memory": {
+                "available": self._memory is not None,
+                "features": {
+                    "similarity_search": True,
+                    "speaker_search": True,
+                    "transcript_search": True,
+                },
+            },
+        }
+
+    # ========================
     # Utilities
     # ========================
 
@@ -1102,14 +1782,26 @@ class AuditoryCortex:
         )
 
     def get_stats(self) -> dict[str, Any]:
-        """Get processing statistics."""
+        """Get processing statistics including SOTA model usage."""
         stats = {
             **self._stats,
             "perception": self._perception.get_stats(),
+            "sota_status": dict(self._sota_status),
+            "sota_features_active": sum(1 for v in self._sota_status.values() if v),
+            "sota_features_total": len(self._sota_status),
         }
 
         if self._memory:
             stats["memory"] = self._memory.get_stats()
+
+        # Add capability summary
+        stats["capabilities"] = {
+            "transcription_engine": "whisperx" if self._sota_status["whisperx"] else "whisper",
+            "tts_engine": "xtts_v2" if self._sota_status["xtts"] else "bark",
+            "emotion_model": "wav2vec2" if self._sota_status["emotion"] else "heuristic",
+            "source_separation": "demucs" if self._sota_status["demucs"] else "none",
+            "audio_understanding": "qwen_audio" if self._sota_status["audio_llm"] else "rule_based",
+        }
 
         return stats
 
