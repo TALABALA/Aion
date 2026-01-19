@@ -153,6 +153,16 @@ try:
         # Audio Captioning
         AudioCaption,
         AudioCaptioner,
+        # Audio Quality Assessment
+        AudioQualityResult,
+        AudioQualityAssessor,
+        # Sound Event Localization and Detection (SELD)
+        LocalizedEvent,
+        SELDResult,
+        SELDDetector,
+        # Audio Inpainting
+        InpaintedAudio,
+        AudioInpainter,
     )
     _SOTA_AVAILABLE = True
 except ImportError:
@@ -236,4 +246,12 @@ __all__ = [
     "MusicGenerator",
     "AudioCaption",
     "AudioCaptioner",
+    # Niche SOTA additions
+    "AudioQualityResult",
+    "AudioQualityAssessor",
+    "LocalizedEvent",
+    "SELDResult",
+    "SELDDetector",
+    "InpaintedAudio",
+    "AudioInpainter",
 ]

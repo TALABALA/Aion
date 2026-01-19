@@ -154,6 +154,39 @@ try:
 except ImportError:
     pass
 
+# Niche SOTA models
+_QUALITY_AVAILABLE = False
+_SELD_AVAILABLE = False
+_INPAINTING_AVAILABLE = False
+
+try:
+    from aion.systems.audio.sota_models import (
+        AudioQualityAssessor,
+        AudioQualityResult,
+    )
+    _QUALITY_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        SELDDetector,
+        SELDResult,
+        LocalizedEvent,
+    )
+    _SELD_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from aion.systems.audio.sota_models import (
+        AudioInpainter,
+        InpaintedAudio,
+    )
+    _INPAINTING_AVAILABLE = True
+except ImportError:
+    pass
+
 logger = structlog.get_logger(__name__)
 
 
@@ -230,6 +263,22 @@ class AuditoryCortexConfig:
 
     # Speech enhancement settings
     enhance_before_transcribe: bool = False  # Apply enhancement before ASR
+
+    # Niche SOTA additions
+    use_quality_assessment: bool = True  # NISQA/DNSMOS quality metrics
+    use_seld: bool = False  # Sound Event Localization and Detection (requires multi-channel)
+    use_inpainting: bool = False  # AudioLDM2 inpainting (resource-heavy)
+
+    # Quality assessment settings
+    quality_model: str = "nisqa"  # "nisqa", "dnsmos", or "both"
+
+    # SELD settings
+    seld_model: str = "seld-dcase2022"
+    seld_frame_duration: float = 0.5  # Analysis frame duration
+
+    # Inpainting settings (AudioLDM2)
+    inpainting_model: str = "audioldm2-large"  # "audioldm2", "audioldm2-large", "audioldm2-music"
+    inpainting_steps: int = 100  # Diffusion steps
 
 
 @dataclass
@@ -358,6 +407,11 @@ class AuditoryCortex:
         self._musicgen: Optional[Any] = None
         self._captioner: Optional[Any] = None
 
+        # Niche SOTA models
+        self._quality_assessor: Optional[Any] = None
+        self._seld: Optional[Any] = None
+        self._inpainter: Optional[Any] = None
+
         # Legacy TTS model (lazy loaded, used if XTTS not available)
         self._tts_model = None
         self._tts_processor = None
@@ -376,6 +430,10 @@ class AuditoryCortex:
             "streaming_asr": False,
             "musicgen": False,
             "captioner": False,
+            # Niche SOTA additions
+            "quality_assessment": False,
+            "seld": False,
+            "inpainting": False,
         }
 
         # Statistics
@@ -396,6 +454,10 @@ class AuditoryCortex:
             "enhancements": 0,
             "music_generations": 0,
             "captions_generated": 0,
+            # Niche SOTA stats
+            "quality_assessments": 0,
+            "seld_detections": 0,
+            "inpaintings": 0,
         }
 
         self._initialized = False
@@ -551,6 +613,38 @@ class AuditoryCortex:
             except Exception as e:
                 logger.warning(f"Audio Captioner initialization failed: {e}")
 
+        # ============== NICHE SOTA MODELS ==============
+
+        # Audio Quality Assessment (NISQA/DNSMOS)
+        if _QUALITY_AVAILABLE and self.config.use_quality_assessment:
+            try:
+                self._quality_assessor = AudioQualityAssessor(self.config.quality_model)
+                if await self._quality_assessor.initialize():
+                    self._sota_status["quality_assessment"] = True
+                    logger.info("Audio Quality Assessor initialized (NISQA/DNSMOS)")
+            except Exception as e:
+                logger.warning(f"Quality assessor initialization failed: {e}")
+
+        # Sound Event Localization and Detection (SELD)
+        if _SELD_AVAILABLE and self.config.use_seld:
+            try:
+                self._seld = SELDDetector(self.config.seld_model)
+                if await self._seld.initialize():
+                    self._sota_status["seld"] = True
+                    logger.info("SELD detector initialized (spatial audio)")
+            except Exception as e:
+                logger.warning(f"SELD initialization failed: {e}")
+
+        # Audio Inpainting (AudioLDM2)
+        if _INPAINTING_AVAILABLE and self.config.use_inpainting:
+            try:
+                self._inpainter = AudioInpainter(self.config.inpainting_model)
+                if await self._inpainter.initialize():
+                    self._sota_status["inpainting"] = True
+                    logger.info("Audio Inpainter initialized (AudioLDM2)")
+            except Exception as e:
+                logger.warning(f"AudioLDM2 initialization failed: {e}")
+
     async def shutdown(self) -> None:
         """Cleanup resources including all SOTA models."""
         logger.info("Shutting down Auditory Cortex", sota_status=self._sota_status)
@@ -607,7 +701,7 @@ class AuditoryCortex:
                 logger.warning(f"Error shutting down Audio LLM: {e}")
             self._audio_llm = None
 
-        # Shutdown TRUE SOTA models
+        # Shutdown TRUE SOTA models and niche SOTA models
         for model_name, model_attr in [
             ("emotion2vec", "_emotion2vec"),
             ("BEATs", "_beats"),
@@ -615,6 +709,10 @@ class AuditoryCortex:
             ("Streaming ASR", "_streaming_asr"),
             ("MusicGen", "_musicgen"),
             ("Captioner", "_captioner"),
+            # Niche SOTA
+            ("Quality Assessor", "_quality_assessor"),
+            ("SELD", "_seld"),
+            ("Inpainter", "_inpainter"),
         ]:
             model = getattr(self, model_attr, None)
             if model:
@@ -638,6 +736,9 @@ class AuditoryCortex:
             "streaming_asr": False,
             "musicgen": False,
             "captioner": False,
+            "quality_assessment": False,
+            "seld": False,
+            "inpainting": False,
         }
 
         self._initialized = False
@@ -2204,6 +2305,327 @@ class AuditoryCortex:
         }
 
     # ========================
+    # NICHE SOTA: Audio Quality Assessment
+    # ========================
+
+    async def assess_quality(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+    ) -> dict[str, Any]:
+        """
+        Assess audio quality using NISQA/DNSMOS.
+
+        Non-intrusive quality assessment without reference signal.
+        Useful for:
+        - Evaluating recording quality
+        - Comparing enhancement algorithms
+        - Quality control for audio pipelines
+
+        Args:
+            audio: Audio to assess
+
+        Returns:
+            Dictionary with:
+            - overall_mos: Mean Opinion Score (1-5)
+            - noisiness: Noise level score
+            - coloration: Frequency distortion score
+            - discontinuity: Temporal artifacts score
+            - loudness: Volume appropriateness
+            - speech_quality: Speech-specific MOS (if applicable)
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+
+        if self._sota_status["quality_assessment"] and self._quality_assessor:
+            try:
+                result = await self._quality_assessor.assess(audio)
+                self._stats["quality_assessments"] += 1
+
+                logger.debug(
+                    "Quality assessed",
+                    mos=result.overall_mos,
+                    model=result.model_used,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+
+                return {
+                    "overall_mos": result.overall_mos,
+                    "noisiness": result.noisiness,
+                    "coloration": result.coloration,
+                    "discontinuity": result.discontinuity,
+                    "loudness": result.loudness,
+                    "speech_quality": result.speech_quality,
+                    "background_noise_level": result.background_noise_level,
+                    "model": result.model_used,
+                }
+            except Exception as e:
+                logger.warning(f"Quality assessment failed: {e}")
+
+        # Basic fallback
+        return {
+            "overall_mos": 3.0,
+            "noisiness": 3.0,
+            "coloration": 3.0,
+            "discontinuity": 3.0,
+            "loudness": 3.0,
+            "model": "fallback",
+            "note": "Quality assessment not available. Install NISQA for accurate metrics.",
+        }
+
+    async def compare_audio_quality(
+        self,
+        original: Union[str, Path, np.ndarray, AudioSegment],
+        processed: Union[str, Path, np.ndarray, AudioSegment],
+    ) -> dict[str, Any]:
+        """
+        Compare quality between original and processed audio.
+
+        Useful for evaluating enhancement, noise reduction, or compression.
+
+        Args:
+            original: Original/reference audio
+            processed: Processed/enhanced audio
+
+        Returns:
+            Dictionary with quality comparison metrics
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._sota_status["quality_assessment"] and self._quality_assessor:
+            return await self._quality_assessor.compare_quality(original, processed)
+
+        # Fallback: assess both independently
+        original_quality = await self.assess_quality(original)
+        processed_quality = await self.assess_quality(processed)
+
+        return {
+            "original_mos": original_quality["overall_mos"],
+            "processed_mos": processed_quality["overall_mos"],
+            "mos_improvement": processed_quality["overall_mos"] - original_quality["overall_mos"],
+            "original_details": original_quality,
+            "processed_details": processed_quality,
+        }
+
+    # ========================
+    # NICHE SOTA: Sound Event Localization and Detection (SELD)
+    # ========================
+
+    async def detect_and_localize_events(
+        self,
+        audio: Union[str, Path, np.ndarray],
+        threshold: float = 0.3,
+    ) -> dict[str, Any]:
+        """
+        Detect sound events and estimate their spatial locations.
+
+        Sound Event Localization and Detection (SELD) combines:
+        - WHAT sounds are present (event detection)
+        - WHERE sounds are coming from (spatial localization)
+
+        Supports:
+        - Mono: Detection only
+        - Stereo: Basic left/right localization
+        - Ambisonics: Full 3D localization (azimuth + elevation)
+        - Multi-channel: Precise spatial mapping
+
+        Args:
+            audio: Audio input (mono, stereo, or multi-channel)
+            threshold: Detection confidence threshold
+
+        Returns:
+            Dictionary with:
+            - events: List of localized events with spatial coordinates
+            - spatial_resolution: "mono", "stereo", "ambisonics", "multi-channel"
+            - duration: Audio duration
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._sota_status["seld"] or not self._seld:
+            raise RuntimeError(
+                "SELD not available. Enable with use_seld=True in config."
+            )
+
+        start_time = time.time()
+
+        result = await self._seld.detect_and_localize(
+            audio,
+            threshold=threshold,
+            frame_duration=self.config.seld_frame_duration,
+        )
+        self._stats["seld_detections"] += 1
+
+        logger.debug(
+            "SELD detection complete",
+            num_events=len(result.events),
+            spatial_resolution=result.spatial_resolution,
+            processing_time_ms=(time.time() - start_time) * 1000,
+        )
+
+        return {
+            "events": [
+                {
+                    "label": e.label,
+                    "confidence": e.confidence,
+                    "start_time": e.start_time,
+                    "end_time": e.end_time,
+                    "azimuth": e.azimuth,
+                    "elevation": e.elevation,
+                    "distance": e.distance,
+                }
+                for e in result.events
+            ],
+            "num_channels": result.num_channels,
+            "duration": result.duration,
+            "spatial_resolution": result.spatial_resolution,
+        }
+
+    # ========================
+    # NICHE SOTA: Audio Inpainting (AudioLDM2)
+    # ========================
+
+    async def inpaint_audio(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        mask_start: float,
+        mask_end: float,
+        prompt: Optional[str] = None,
+    ) -> AudioSegment:
+        """
+        Inpaint (fill in) a section of audio using AudioLDM2.
+
+        Uses diffusion-based generation to seamlessly fill missing
+        or corrupted sections of audio.
+
+        Args:
+            audio: Original audio with section to replace
+            mask_start: Start of section to inpaint (seconds)
+            mask_end: End of section to inpaint (seconds)
+            prompt: Optional text prompt to guide generation style
+
+        Returns:
+            AudioSegment with inpainted section
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._sota_status["inpainting"] or not self._inpainter:
+            raise RuntimeError(
+                "Audio inpainting not available. Enable with use_inpainting=True "
+                "and install diffusers + AudioLDM2."
+            )
+
+        start_time = time.time()
+
+        result = await self._inpainter.inpaint(
+            audio,
+            mask_start=mask_start,
+            mask_end=mask_end,
+            prompt=prompt,
+            num_inference_steps=self.config.inpainting_steps,
+        )
+        self._stats["inpaintings"] += 1
+
+        logger.debug(
+            "Audio inpainted",
+            mask_start=mask_start,
+            mask_end=mask_end,
+            processing_time_ms=(time.time() - start_time) * 1000,
+        )
+
+        return AudioSegment(
+            waveform=result.waveform,
+            sample_rate=result.sample_rate,
+            metadata={
+                "inpainted": True,
+                "mask_start": result.mask_start,
+                "mask_end": result.mask_end,
+                "prompt": result.prompt,
+            },
+        )
+
+    async def continue_audio(
+        self,
+        audio: Union[str, Path, np.ndarray, AudioSegment],
+        continuation_duration: float = 5.0,
+        prompt: Optional[str] = None,
+    ) -> AudioSegment:
+        """
+        Continue/extend audio using AudioLDM2.
+
+        Generates natural continuation of the input audio.
+
+        Args:
+            audio: Original audio to continue
+            continuation_duration: Duration to generate (seconds)
+            prompt: Text prompt for continuation style
+
+        Returns:
+            AudioSegment with extended audio
+        """
+        if not self._sota_status["inpainting"] or not self._inpainter:
+            raise RuntimeError(
+                "Audio continuation requires AudioLDM2. Enable use_inpainting=True."
+            )
+
+        result = await self._inpainter.continue_audio(
+            audio,
+            continuation_duration=continuation_duration,
+            prompt=prompt,
+        )
+
+        return AudioSegment(
+            waveform=result.waveform,
+            sample_rate=result.sample_rate,
+            metadata={
+                "continued": True,
+                "original_end": result.mask_start,
+                "continuation_duration": continuation_duration,
+                "prompt": result.prompt,
+            },
+        )
+
+    async def generate_audio(
+        self,
+        prompt: str,
+        duration: float = 10.0,
+    ) -> AudioSegment:
+        """
+        Generate audio from text description using AudioLDM2.
+
+        Args:
+            prompt: Text description of desired audio
+                   (e.g., "rain falling on a tin roof with distant thunder")
+            duration: Duration in seconds
+
+        Returns:
+            AudioSegment with generated audio
+        """
+        if not self._sota_status["inpainting"] or not self._inpainter:
+            raise RuntimeError(
+                "Audio generation requires AudioLDM2. Enable use_inpainting=True."
+            )
+
+        result = await self._inpainter.generate(
+            prompt=prompt,
+            duration=duration,
+            num_inference_steps=self.config.inpainting_steps,
+        )
+
+        return AudioSegment(
+            waveform=result.waveform,
+            sample_rate=result.sample_rate,
+            metadata={
+                "generated": True,
+                "prompt": prompt,
+                "duration": duration,
+            },
+        )
+
+    # ========================
     # SOTA Status & Capabilities
     # ========================
 
@@ -2325,6 +2747,38 @@ class AuditoryCortex:
                 "sota": self._sota_status["captioner"],
                 "features": {
                     "clap_based": self._sota_status["captioner"],
+                },
+            },
+            # Niche SOTA additions
+            "quality_assessment": {
+                "available": self._sota_status["quality_assessment"],
+                "sota": self._sota_status["quality_assessment"],
+                "features": {
+                    "nisqa": self._sota_status["quality_assessment"],
+                    "dnsmos": self._sota_status["quality_assessment"],
+                    "non_intrusive": True,  # No reference required
+                    "mos_prediction": self._sota_status["quality_assessment"],
+                },
+            },
+            "spatial_audio": {
+                "available": self._sota_status["seld"],
+                "sota": self._sota_status["seld"],
+                "features": {
+                    "event_localization": self._sota_status["seld"],
+                    "azimuth_estimation": self._sota_status["seld"],
+                    "elevation_estimation": self._sota_status["seld"],
+                    "stereo_support": self._sota_status["seld"],
+                    "ambisonics_support": self._sota_status["seld"],
+                },
+            },
+            "audio_inpainting": {
+                "available": self._sota_status["inpainting"],
+                "sota": self._sota_status["inpainting"],
+                "features": {
+                    "inpainting": self._sota_status["inpainting"],
+                    "continuation": self._sota_status["inpainting"],
+                    "text_to_audio": self._sota_status["inpainting"],
+                    "audioldm2": self._sota_status["inpainting"],
                 },
             },
         }

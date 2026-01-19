@@ -116,3 +116,27 @@ speechbrain>=1.0.0
 # Silero VAD: Fast and accurate voice activity detection
 # Used by streaming ASR for better segmentation
 # torch.hub.load('snakers4/silero-vad', 'silero_vad')
+
+# ==================== NICHE SOTA (Optional) ====================
+# These are specialized features for advanced use cases:
+
+# NISQA: Non-Intrusive Speech Quality Assessment
+# Neural network-based MOS prediction without reference
+# pip install nisqa
+# Reference: https://github.com/gabrielmittag/NISQA
+
+# DNSMOS: Microsoft Deep Noise Suppression MOS
+# Quality metric for noise suppression evaluation
+# Available via onnxruntime (included in torch install)
+# Reference: https://github.com/microsoft/DNS-Challenge
+
+# SELD: Sound Event Localization and Detection
+# Spatial audio understanding for multi-channel audio
+# Uses AST/BEATs for detection (included via transformers)
+# Reference: https://github.com/sharathadavanne/seld-dcase2022
+
+# AudioLDM2: Diffusion-based audio generation and inpainting
+# Text-to-audio, audio continuation, and inpainting
+# pip install diffusers>=0.25.0
+# diffusers>=0.25.0
+# Reference: https://github.com/haoheliu/AudioLDM2
