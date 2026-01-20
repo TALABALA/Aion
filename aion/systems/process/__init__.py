@@ -298,6 +298,45 @@ from aion.systems.process.pool import (
     get_pool_manager,
 )
 
+# === TRUE SOTA FEATURES ===
+
+# Raft Consensus
+from aion.systems.process.consensus import (
+    RaftNode,
+    RaftState,
+    RaftLog,
+    LogEntry,
+    Snapshot,
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    RequestVoteRequest,
+    RequestVoteResponse,
+    NotLeaderError,
+    # Vector Clocks
+    VectorClock,
+    # SWIM Protocol
+    SWIMProtocol,
+    SWIMMember,
+    SWIMState,
+)
+
+# Advanced Patterns
+from aion.systems.process.advanced_patterns import (
+    # Adaptive Circuit Breaker
+    AdaptiveCircuitBreaker,
+    CircuitBreakerOpenError,
+    # Hedge Requests
+    HedgeRequest,
+    # Tail-Based Sampling
+    TailBasedSampler,
+    SamplingDecision,
+    TraceData,
+    # Dynamic DAGs
+    DynamicDAG,
+    DynamicTask,
+    BackfillOperation,
+)
+
 __all__ = [
     # === Core ===
     # State enums
@@ -459,6 +498,35 @@ __all__ = [
     "PoolExhaustedError",
     "OptimizedCronParser",
     "get_pool_manager",
+
+    # === TRUE SOTA ===
+
+    # Raft Consensus
+    "RaftNode",
+    "RaftState",
+    "RaftLog",
+    "LogEntry",
+    "Snapshot",
+    "AppendEntriesRequest",
+    "AppendEntriesResponse",
+    "RequestVoteRequest",
+    "RequestVoteResponse",
+    "NotLeaderError",
+    "VectorClock",
+    "SWIMProtocol",
+    "SWIMMember",
+    "SWIMState",
+
+    # Advanced Patterns
+    "AdaptiveCircuitBreaker",
+    "CircuitBreakerOpenError",
+    "HedgeRequest",
+    "TailBasedSampler",
+    "SamplingDecision",
+    "TraceData",
+    "DynamicDAG",
+    "DynamicTask",
+    "BackfillOperation",
 ]
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
