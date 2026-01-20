@@ -101,6 +101,47 @@ class VisionConfig(BaseModel):
     scene_graph_enabled: bool = True
 
 
+class AudioConfig(BaseModel):
+    """Configuration for the Auditory Cortex System."""
+    enabled: bool = True
+    device: str = "auto"  # "cpu", "cuda", "mps", "auto"
+
+    # ASR (Speech Recognition)
+    whisper_model: str = "openai/whisper-large-v3"
+    whisper_language: Optional[str] = None  # Auto-detect if None
+
+    # TTS (Text-to-Speech)
+    tts_model: str = "suno/bark-small"
+    enable_tts: bool = True
+
+    # Speaker Diarization
+    enable_diarization: bool = True
+    diarization_model: str = "pyannote/speaker-diarization-3.1"
+
+    # Audio Event Detection
+    event_detection_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
+    event_threshold: float = 0.3
+
+    # Speaker Recognition
+    speaker_embedding_model: str = "speechbrain/spkrec-ecapa-voxceleb"
+
+    # Audio-Text Embeddings
+    clap_model: str = "laion/larger_clap_general"
+
+    # Memory
+    enable_memory: bool = True
+    memory_embedding_dim: int = 512
+    memory_max_entries: int = 50000
+    memory_index_path: Optional[str] = None
+
+    # Music Analysis
+    enable_music_analysis: bool = True
+
+    # Processing limits
+    max_audio_duration: float = 600.0  # 10 minutes max
+    target_sample_rate: int = 16000
+
+
 class SecurityConfig(BaseModel):
     """Configuration for the Security System."""
     require_approval_for_high_risk: bool = True
@@ -151,6 +192,7 @@ class AIONConfig(BaseSettings):
     tools: ToolConfig = Field(default_factory=ToolConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 

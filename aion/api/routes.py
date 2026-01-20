@@ -466,3 +466,338 @@ def setup_vision_routes(app: FastAPI, visual_cortex) -> None:
     async def vision_stats():
         """Get visual cortex statistics."""
         return visual_cortex.get_stats()
+
+
+# ==================== Audio Request/Response Models ====================
+
+class AudioTranscribeRequest(BaseModel):
+    """Request to transcribe audio from URL."""
+    audio_url: str
+    language: Optional[str] = None
+    enable_diarization: bool = True
+    enable_timestamps: bool = True
+
+
+class AudioSynthesizeRequest(BaseModel):
+    """Request to synthesize speech."""
+    text: str = Field(..., description="Text to synthesize")
+    voice: Optional[str] = Field(default=None, description="Voice preset or speaker ID")
+    language: str = Field(default="en")
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+
+
+class AudioQuestionRequest(BaseModel):
+    """Request to answer a question about audio."""
+    audio_url: str
+    question: str
+
+
+class AudioMemoryRequest(BaseModel):
+    """Request to store audio in memory."""
+    audio_url: str
+    context: Optional[str] = None
+    importance: float = Field(default=0.5, ge=0, le=1)
+    tags: Optional[list[str]] = None
+
+
+class AudioSearchRequest(BaseModel):
+    """Request to search audio memory."""
+    query: str
+    limit: int = Field(default=5, ge=1, le=50)
+
+
+class SpeakerRegisterRequest(BaseModel):
+    """Request to register a speaker."""
+    audio_url: str
+    name: str
+
+
+def setup_audio_routes(app: FastAPI, audio_cortex) -> None:
+    """Setup routes for the Auditory Cortex system."""
+
+    @app.post("/audio/transcribe")
+    async def transcribe_audio(request: AudioTranscribeRequest):
+        """
+        Transcribe audio to text with optional speaker diarization.
+
+        Returns transcript with word-level timestamps and speaker attribution.
+        """
+        transcript = await audio_cortex.transcribe(
+            audio=request.audio_url,
+            language=request.language,
+            enable_diarization=request.enable_diarization,
+            enable_timestamps=request.enable_timestamps,
+        )
+        return {"transcript": transcript.to_dict()}
+
+    @app.post("/audio/transcribe-upload")
+    async def transcribe_uploaded_audio(
+        file: UploadFile = File(...),
+        language: Optional[str] = Query(default=None),
+        enable_diarization: bool = Query(default=True),
+    ):
+        """Transcribe an uploaded audio file."""
+        audio_bytes = await file.read()
+        transcript = await audio_cortex.transcribe(
+            audio=audio_bytes,
+            language=language,
+            enable_diarization=enable_diarization,
+        )
+        return {"transcript": transcript.to_dict()}
+
+    @app.post("/audio/detect-events")
+    async def detect_audio_events(
+        audio_url: str = Body(..., embed=True),
+        threshold: float = Body(default=0.3, embed=True),
+    ):
+        """
+        Detect audio events (speech, music, environmental sounds).
+
+        Returns list of detected events with timestamps and confidence.
+        """
+        events = await audio_cortex.detect_events(audio_url, threshold=threshold)
+        return {"events": [e.to_dict() for e in events]}
+
+    @app.post("/audio/detect-events-upload")
+    async def detect_events_upload(
+        file: UploadFile = File(...),
+        threshold: float = Query(default=0.3),
+    ):
+        """Detect events in uploaded audio."""
+        audio_bytes = await file.read()
+        events = await audio_cortex.detect_events(audio_bytes, threshold=threshold)
+        return {"events": [e.to_dict() for e in events]}
+
+    @app.post("/audio/understand")
+    async def understand_audio(
+        audio_url: str = Body(..., embed=True),
+        store_in_memory: bool = Body(default=False, embed=True),
+        context: Optional[str] = Body(default=None, embed=True),
+    ):
+        """
+        Full audio scene understanding.
+
+        Combines transcription, event detection, speaker diarization,
+        and music analysis for comprehensive audio understanding.
+        """
+        scene = await audio_cortex.understand_scene(
+            audio=audio_url,
+            store_in_memory=store_in_memory,
+            context=context or "",
+        )
+        return {"scene": scene.to_dict()}
+
+    @app.post("/audio/understand-upload")
+    async def understand_audio_upload(
+        file: UploadFile = File(...),
+        store_in_memory: bool = Query(default=False),
+    ):
+        """Full understanding of uploaded audio."""
+        audio_bytes = await file.read()
+        scene = await audio_cortex.understand_scene(
+            audio=audio_bytes,
+            store_in_memory=store_in_memory,
+        )
+        return {"scene": scene.to_dict()}
+
+    @app.post("/audio/synthesize")
+    async def synthesize_speech(request: AudioSynthesizeRequest):
+        """
+        Generate speech from text.
+
+        Returns audio segment with waveform data encoded as base64.
+        """
+        import base64
+
+        audio = await audio_cortex.synthesize(
+            text=request.text,
+            voice=request.voice,
+            language=request.language,
+            speed=request.speed,
+        )
+
+        # Encode waveform as base64 for JSON transport
+        waveform_b64 = None
+        if audio.waveform is not None:
+            import io
+            import soundfile as sf
+            buf = io.BytesIO()
+            sf.write(buf, audio.waveform, audio.sample_rate, format='WAV')
+            waveform_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+        return {
+            "audio": {
+                "id": audio.id,
+                "duration": audio.duration,
+                "sample_rate": audio.sample_rate,
+                "waveform_base64": waveform_b64,
+                "metadata": audio.metadata,
+            }
+        }
+
+    @app.post("/audio/identify-speaker")
+    async def identify_speaker(audio_url: str = Body(..., embed=True)):
+        """
+        Identify speaker in audio.
+
+        Matches against registered speakers and returns identification result.
+        """
+        speaker, confidence = await audio_cortex.identify_speaker(audio_url)
+        return {
+            "speaker": speaker.to_dict() if speaker else None,
+            "confidence": confidence,
+            "identified": speaker is not None,
+        }
+
+    @app.post("/audio/identify-speaker-upload")
+    async def identify_speaker_upload(file: UploadFile = File(...)):
+        """Identify speaker from uploaded audio."""
+        audio_bytes = await file.read()
+        speaker, confidence = await audio_cortex.identify_speaker(audio_bytes)
+        return {
+            "speaker": speaker.to_dict() if speaker else None,
+            "confidence": confidence,
+            "identified": speaker is not None,
+        }
+
+    @app.post("/audio/register-speaker")
+    async def register_speaker(request: SpeakerRegisterRequest):
+        """
+        Register a new speaker from sample audio.
+
+        The audio should contain clear speech from a single speaker.
+        """
+        speaker = await audio_cortex.register_speaker(
+            audio=request.audio_url,
+            name=request.name,
+        )
+        return {"speaker": speaker.to_dict()}
+
+    @app.post("/audio/register-speaker-upload")
+    async def register_speaker_upload(
+        file: UploadFile = File(...),
+        name: str = Query(...),
+    ):
+        """Register a speaker from uploaded audio."""
+        audio_bytes = await file.read()
+        speaker = await audio_cortex.register_speaker(audio=audio_bytes, name=name)
+        return {"speaker": speaker.to_dict()}
+
+    @app.post("/audio/verify-speaker")
+    async def verify_speaker(
+        audio_url: str = Body(...),
+        speaker_id: str = Body(...),
+    ):
+        """Verify if audio matches a claimed speaker."""
+        # Get registered speaker
+        if audio_cortex.memory:
+            registered_speakers = await audio_cortex.memory.get_registered_speakers()
+            speaker = next((s for s in registered_speakers if s.id == speaker_id), None)
+            if speaker:
+                is_verified, similarity = await audio_cortex.verify_speaker(
+                    audio=audio_url,
+                    claimed_speaker=speaker,
+                )
+                return {
+                    "verified": is_verified,
+                    "similarity": similarity,
+                    "threshold": 0.75,
+                }
+        return {"verified": False, "similarity": 0.0, "error": "Speaker not found"}
+
+    @app.post("/audio/compare-speakers")
+    async def compare_speakers(
+        audio1_url: str = Body(...),
+        audio2_url: str = Body(...),
+    ):
+        """Compare two audio samples for speaker similarity."""
+        is_same, similarity = await audio_cortex.compare_speakers(
+            audio1=audio1_url,
+            audio2=audio2_url,
+        )
+        return {
+            "same_speaker": is_same,
+            "similarity": similarity,
+            "threshold": 0.75,
+        }
+
+    @app.post("/audio/answer")
+    async def answer_audio_question(request: AudioQuestionRequest):
+        """
+        Answer a question about audio content.
+
+        Uses audio understanding and LLM reasoning to answer questions.
+        """
+        answer = await audio_cortex.answer_question(
+            audio=request.audio_url,
+            question=request.question,
+        )
+        return {"answer": answer, "question": request.question}
+
+    @app.post("/audio/summarize")
+    async def summarize_audio(audio_url: str = Body(..., embed=True)):
+        """Generate a summary of audio content."""
+        summary = await audio_cortex.summarize(audio_url)
+        return {"summary": summary}
+
+    @app.post("/audio/compare")
+    async def compare_audio(
+        audio1_url: str = Body(...),
+        audio2_url: str = Body(...),
+    ):
+        """Compare two audio samples."""
+        comparison = await audio_cortex.compare(audio1_url, audio2_url)
+        return {"comparison": comparison.to_dict()}
+
+    @app.post("/audio/analyze-music")
+    async def analyze_music(audio_url: str = Body(..., embed=True)):
+        """Analyze music content (tempo, key, mood, etc.)."""
+        analysis = await audio_cortex.analyze_music(audio_url)
+        return {"analysis": analysis.to_dict()}
+
+    @app.post("/audio/remember")
+    async def remember_audio(request: AudioMemoryRequest):
+        """Store audio in memory for later retrieval."""
+        memory_id = await audio_cortex.remember(
+            audio=request.audio_url,
+            context=request.context,
+            importance=request.importance,
+            tags=request.tags,
+        )
+        return {"memory_id": memory_id, "stored": True}
+
+    @app.post("/audio/recall")
+    async def recall_audio(request: AudioSearchRequest):
+        """Retrieve similar audio from memory."""
+        results = await audio_cortex.recall_similar(
+            query=request.query,
+            limit=request.limit,
+        )
+        return {"results": [r.to_dict() for r in results]}
+
+    @app.post("/audio/recall-by-tags")
+    async def recall_by_tags(
+        tags: list[str] = Body(...),
+        require_all: bool = Body(default=False),
+        limit: int = Body(default=10),
+    ):
+        """Retrieve audio by tags."""
+        results = await audio_cortex.recall_by_tags(
+            tags=tags,
+            require_all=require_all,
+            limit=limit,
+        )
+        return {"results": [r.to_dict() for r in results]}
+
+    @app.get("/audio/stats")
+    async def audio_stats():
+        """Get audio system statistics."""
+        return audio_cortex.get_stats()
+
+    @app.get("/audio/speakers")
+    async def list_speakers():
+        """List all registered speakers."""
+        if audio_cortex.memory:
+            speakers = await audio_cortex.memory.get_registered_speakers()
+            return {"speakers": [s.to_dict() for s in speakers]}
+        return {"speakers": []}
