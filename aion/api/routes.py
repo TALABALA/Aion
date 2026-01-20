@@ -81,6 +81,49 @@ class ApprovalRequest(BaseModel):
     reason: Optional[str] = None
 
 
+# Process Manager Request/Response Models
+class SpawnAgentRequest(BaseModel):
+    """Request to spawn a new agent."""
+    name: str = Field(..., description="Agent name")
+    agent_class: str = Field(..., description="Registered agent class name")
+    priority: str = Field(default="NORMAL", description="Process priority")
+    restart_policy: str = Field(default="on_failure", description="Restart policy")
+    max_restarts: int = Field(default=5, description="Maximum restarts")
+    system_prompt: Optional[str] = None
+    tools: list[str] = Field(default_factory=list)
+    initial_goal: Optional[str] = None
+    instructions: list[str] = Field(default_factory=list)
+    input_channels: list[str] = Field(default_factory=list)
+    output_channels: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ScheduleTaskRequest(BaseModel):
+    """Request to schedule a task."""
+    name: str = Field(..., description="Task name")
+    handler: str = Field(..., description="Handler function name")
+    schedule_type: str = Field(..., description="once, interval, or cron")
+    params: dict = Field(default_factory=dict)
+    cron_expression: Optional[str] = None
+    interval_seconds: Optional[int] = None
+    run_at: Optional[datetime] = None
+    priority: str = Field(default="NORMAL")
+    timeout_seconds: int = Field(default=300)
+
+
+class ProcessSignalRequest(BaseModel):
+    """Request to send a signal to a process."""
+    signal: str = Field(..., description="Signal type")
+    payload: dict = Field(default_factory=dict)
+
+
+class EmitEventRequest(BaseModel):
+    """Request to emit an event."""
+    type: str = Field(..., description="Event type/channel")
+    payload: dict = Field(..., description="Event payload")
+
+
 # ==================== Route Setup Functions ====================
 
 def setup_routes(app: FastAPI, kernel) -> None:
@@ -468,6 +511,411 @@ def setup_vision_routes(app: FastAPI, visual_cortex) -> None:
         return visual_cortex.get_stats()
 
 
+def setup_process_routes(app: FastAPI, kernel) -> None:
+    """Setup routes for the Process & Agent Manager system."""
+    import uuid
+
+    # Conditional imports
+    try:
+        from aion.systems.process import (
+            AgentConfig,
+            ProcessPriority,
+            RestartPolicy,
+            Event,
+        )
+        process_available = True
+    except ImportError:
+        process_available = False
+
+    if not process_available:
+        logger.warning("Process manager not available, skipping routes")
+        return
+
+    # ==================== Process Management ====================
+
+    @app.get("/processes")
+    async def list_processes(
+        state: Optional[str] = None,
+        process_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        tag: Optional[str] = None,
+    ):
+        """List all processes with optional filtering."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        processes = kernel.supervisor.get_all_processes()
+
+        # Apply filters
+        if state:
+            processes = [p for p in processes if p.state.value == state]
+        if process_type:
+            processes = [p for p in processes if p.type.value == process_type]
+        if priority:
+            processes = [p for p in processes if p.priority.name == priority]
+        if tag:
+            processes = [p for p in processes if tag in p.tags]
+
+        return {"processes": [p.to_dict() for p in processes]}
+
+    @app.get("/processes/{process_id}")
+    async def get_process(process_id: str):
+        """Get process details by ID."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        process = kernel.supervisor.get_process(process_id)
+        if not process:
+            raise HTTPException(status_code=404, detail="Process not found")
+
+        return {"process": process.to_dict()}
+
+    @app.post("/processes/spawn")
+    async def spawn_agent(request: SpawnAgentRequest):
+        """Spawn a new agent process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        try:
+            config = AgentConfig(
+                name=request.name,
+                agent_class=request.agent_class,
+                priority=ProcessPriority[request.priority],
+                restart_policy=RestartPolicy(request.restart_policy),
+                max_restarts=request.max_restarts,
+                system_prompt=request.system_prompt,
+                tools=request.tools,
+                initial_goal=request.initial_goal,
+                instructions=request.instructions,
+                input_channels=request.input_channels,
+                output_channels=request.output_channels,
+                metadata=request.metadata,
+                tags=request.tags,
+            )
+
+            process_id = await kernel.supervisor.spawn_agent(config)
+            return {"process_id": process_id, "status": "spawned"}
+
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+
+    @app.post("/processes/{process_id}/stop")
+    async def stop_process(
+        process_id: str,
+        graceful: bool = True,
+        timeout: float = 30.0,
+    ):
+        """Stop a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        success = await kernel.supervisor.stop_process(process_id, graceful, timeout)
+        return {"success": success}
+
+    @app.post("/processes/{process_id}/kill")
+    async def kill_process(process_id: str):
+        """Force terminate a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        success = await kernel.supervisor.kill_process(process_id)
+        return {"success": success}
+
+    @app.post("/processes/{process_id}/pause")
+    async def pause_process(process_id: str):
+        """Pause a running process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        success = await kernel.supervisor.pause_process(process_id)
+        return {"success": success}
+
+    @app.post("/processes/{process_id}/resume")
+    async def resume_process(process_id: str):
+        """Resume a paused process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        success = await kernel.supervisor.resume_process(process_id)
+        return {"success": success}
+
+    @app.post("/processes/{process_id}/restart")
+    async def restart_process(process_id: str):
+        """Restart a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        success = await kernel.supervisor.restart_process(process_id)
+        return {"success": success}
+
+    @app.post("/processes/{process_id}/signal")
+    async def send_signal(process_id: str, request: ProcessSignalRequest):
+        """Send a signal to a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        from aion.systems.process import SignalType
+        try:
+            signal = SignalType(request.signal)
+        except ValueError:
+            signal = request.signal
+
+        success = await kernel.supervisor.send_signal(process_id, signal, request.payload)
+        return {"success": success}
+
+    @app.get("/processes/{process_id}/children")
+    async def get_process_children(process_id: str):
+        """Get child processes of a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        children = kernel.supervisor.get_children(process_id)
+        return {"children": [c.to_dict() for c in children]}
+
+    @app.get("/processes/{process_id}/checkpoints")
+    async def get_process_checkpoints(process_id: str):
+        """Get checkpoints for a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        checkpoints = kernel.supervisor.get_checkpoints(process_id)
+        return {"checkpoints": [c.to_dict() for c in checkpoints]}
+
+    @app.post("/processes/{process_id}/checkpoint")
+    async def create_checkpoint(process_id: str, reason: str = Body(default="manual", embed=True)):
+        """Create a checkpoint for a process."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        checkpoint = await kernel.supervisor.create_checkpoint(process_id, reason)
+        if not checkpoint:
+            raise HTTPException(status_code=404, detail="Process not found or not running")
+
+        return {"checkpoint": checkpoint.to_dict()}
+
+    @app.get("/processes/stats")
+    async def get_process_stats():
+        """Get process supervisor statistics."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        return kernel.supervisor.get_stats()
+
+    @app.get("/processes/registered-classes")
+    async def get_registered_classes():
+        """Get list of registered agent classes."""
+        if not kernel.supervisor:
+            raise HTTPException(status_code=503, detail="Process supervisor not available")
+
+        return {"classes": kernel.supervisor.get_registered_classes()}
+
+    # ==================== Task Scheduling ====================
+
+    @app.get("/tasks")
+    async def list_tasks(
+        enabled: Optional[bool] = None,
+        schedule_type: Optional[str] = None,
+        tag: Optional[str] = None,
+    ):
+        """List scheduled tasks."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        tasks = kernel.scheduler.get_all_tasks()
+
+        if enabled is not None:
+            tasks = [t for t in tasks if t.enabled == enabled]
+        if schedule_type:
+            tasks = [t for t in tasks if t.schedule_type == schedule_type]
+        if tag:
+            tasks = [t for t in tasks if tag in t.tags]
+
+        return {"tasks": [t.to_dict() for t in tasks]}
+
+    @app.get("/tasks/{task_id}")
+    async def get_task(task_id: str):
+        """Get task details."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        task = kernel.scheduler.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        return {"task": task.to_dict()}
+
+    @app.post("/tasks/schedule")
+    async def schedule_task(request: ScheduleTaskRequest):
+        """Schedule a new task."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        try:
+            if request.schedule_type == "once":
+                if not request.run_at:
+                    raise HTTPException(status_code=400, detail="run_at required for once")
+                task_id = await kernel.scheduler.schedule_once(
+                    name=request.name,
+                    handler=request.handler,
+                    run_at=request.run_at,
+                    params=request.params,
+                    priority=ProcessPriority[request.priority],
+                    timeout_seconds=request.timeout_seconds,
+                )
+            elif request.schedule_type == "interval":
+                if not request.interval_seconds:
+                    raise HTTPException(status_code=400, detail="interval_seconds required")
+                task_id = await kernel.scheduler.schedule_interval(
+                    name=request.name,
+                    handler=request.handler,
+                    interval_seconds=request.interval_seconds,
+                    params=request.params,
+                    priority=ProcessPriority[request.priority],
+                    timeout_seconds=request.timeout_seconds,
+                )
+            elif request.schedule_type == "cron":
+                if not request.cron_expression:
+                    raise HTTPException(status_code=400, detail="cron_expression required")
+                task_id = await kernel.scheduler.schedule_cron(
+                    name=request.name,
+                    handler=request.handler,
+                    cron_expression=request.cron_expression,
+                    params=request.params,
+                    priority=ProcessPriority[request.priority],
+                    timeout_seconds=request.timeout_seconds,
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"Unknown schedule_type: {request.schedule_type}")
+
+            return {"task_id": task_id, "status": "scheduled"}
+
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.delete("/tasks/{task_id}")
+    async def cancel_task(task_id: str):
+        """Cancel a scheduled task."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        success = await kernel.scheduler.cancel_task(task_id)
+        return {"success": success}
+
+    @app.post("/tasks/{task_id}/pause")
+    async def pause_task(task_id: str):
+        """Pause a scheduled task."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        success = await kernel.scheduler.pause_task(task_id)
+        return {"success": success}
+
+    @app.post("/tasks/{task_id}/resume")
+    async def resume_task(task_id: str):
+        """Resume a paused task."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        success = await kernel.scheduler.resume_task(task_id)
+        return {"success": success}
+
+    @app.post("/tasks/{task_id}/trigger")
+    async def trigger_task(task_id: str):
+        """Manually trigger a task immediately."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        process_id = await kernel.scheduler.trigger_task(task_id)
+        if not process_id:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        return {"process_id": process_id}
+
+    @app.get("/tasks/stats")
+    async def get_scheduler_stats():
+        """Get scheduler statistics."""
+        if not kernel.scheduler:
+            raise HTTPException(status_code=503, detail="Task scheduler not available")
+
+        return kernel.scheduler.get_stats()
+
+    # ==================== Event Bus ====================
+
+    @app.get("/events/history")
+    async def get_event_history(
+        pattern: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        """Get event history."""
+        if not kernel.event_bus:
+            raise HTTPException(status_code=503, detail="Event bus not available")
+
+        events = kernel.event_bus.get_history(pattern, limit)
+        return {"events": [e.to_dict() for e in events]}
+
+    @app.post("/events/emit")
+    async def emit_event(request: EmitEventRequest):
+        """Emit an event to the event bus."""
+        if not kernel.event_bus:
+            raise HTTPException(status_code=503, detail="Event bus not available")
+
+        event = Event(
+            id=str(uuid.uuid4()),
+            type=request.type,
+            source="api",
+            payload=request.payload,
+        )
+
+        await kernel.event_bus.emit(event)
+        return {"event_id": event.id, "status": "emitted"}
+
+    @app.get("/events/stats")
+    async def get_event_bus_stats():
+        """Get event bus statistics."""
+        if not kernel.event_bus:
+            raise HTTPException(status_code=503, detail="Event bus not available")
+
+        return kernel.event_bus.get_stats()
+
+    @app.get("/events/patterns")
+    async def get_subscribed_patterns():
+        """Get all subscribed patterns."""
+        if not kernel.event_bus:
+            raise HTTPException(status_code=503, detail="Event bus not available")
+
+        return {"patterns": kernel.event_bus.get_all_patterns()}
+
+    # ==================== Worker Pool ====================
+
+    @app.get("/workers")
+    async def get_workers():
+        """Get worker pool information."""
+        if not kernel.worker_pool:
+            raise HTTPException(status_code=503, detail="Worker pool not available")
+
+        workers = kernel.worker_pool.get_workers()
+        return {
+            "workers": [w.to_dict() for w in workers],
+            "stats": kernel.worker_pool.get_stats(),
+        }
+
+    @app.get("/workers/stats")
+    async def get_worker_pool_stats():
+        """Get worker pool statistics."""
+        if not kernel.worker_pool:
+            raise HTTPException(status_code=503, detail="Worker pool not available")
+
+        return kernel.worker_pool.get_stats()
+
+    # ==================== Combined Stats ====================
+
+    @app.get("/process-manager/stats")
+    async def get_all_process_stats():
+        """Get comprehensive process manager statistics."""
+        return kernel.get_process_stats()
 # ==================== Audio Request/Response Models ====================
 
 class AudioTranscribeRequest(BaseModel):

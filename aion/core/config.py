@@ -167,6 +167,67 @@ class MonitoringConfig(BaseModel):
     alert_threshold_error_rate: float = 0.05
 
 
+class ProcessConfig(BaseModel):
+    """Configuration for the Process & Agent Manager System."""
+    # Supervisor settings
+    max_processes: int = 100
+    health_check_interval: float = 5.0
+    default_restart_delay: float = 1.0
+    default_max_restarts: int = 5
+    zombie_timeout_seconds: float = 300.0
+    enable_resource_monitoring: bool = True
+
+    # Scheduler settings
+    scheduler_check_interval: float = 1.0
+    max_concurrent_scheduled_tasks: int = 10
+
+    # Worker pool settings
+    worker_pool_min_workers: int = 2
+    worker_pool_max_workers: int = 10
+    worker_pool_max_queue_size: int = 1000
+    worker_pool_enable_auto_scaling: bool = True
+
+    # Event bus settings
+    event_bus_max_history: int = 10000
+    event_bus_max_dead_letters: int = 1000
+    event_bus_default_ttl_seconds: Optional[int] = None
+
+    # Persistence settings
+    persistence_enabled: bool = True
+    persistence_type: Literal["sqlite", "memory", "postgres"] = "sqlite"
+    persistence_path: Optional[Path] = None
+    persistence_cleanup_interval: int = 3600
+
+    # Resource limits (system-wide defaults)
+    default_max_memory_mb: Optional[int] = None
+    default_max_tokens_per_minute: Optional[int] = 10000
+    default_max_tokens_total: Optional[int] = None
+    default_max_runtime_seconds: Optional[int] = None
+
+    # System agents
+    enable_health_monitor: bool = True
+    enable_garbage_collector: bool = True
+    enable_metrics_collector: bool = True
+    enable_watchdog: bool = True
+
+    # Health monitor settings
+    health_monitor_interval: int = 30
+    health_monitor_memory_threshold: float = 80.0
+    health_monitor_cpu_threshold: float = 90.0
+
+    # Garbage collector settings
+    gc_interval: int = 300
+    gc_max_completed_age: int = 3600
+
+    # Metrics collector settings
+    metrics_collect_interval: int = 60
+
+    # Watchdog settings
+    watchdog_check_interval: int = 30
+    watchdog_heartbeat_timeout: int = 120
+    watchdog_idle_timeout: int = 600
+
+
 class AIONConfig(BaseSettings):
     """
     Main AION Configuration
@@ -195,6 +256,7 @@ class AIONConfig(BaseSettings):
     audio: AudioConfig = Field(default_factory=AudioConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    process: ProcessConfig = Field(default_factory=ProcessConfig)
 
     # Data paths
     data_dir: Path = Field(default=Path("./data"))

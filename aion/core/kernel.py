@@ -24,6 +24,23 @@ from aion.core.config import AIONConfig, get_config
 from aion.core.security import SecurityManager, RiskLevel
 from aion.core.llm import LLMAdapter, LLMConfig, LLMProvider, Message
 
+# Process manager imports (conditional to avoid import errors)
+try:
+    from aion.systems.process import (
+        ProcessSupervisor,
+        EventBus,
+        TaskScheduler,
+        WorkerPool,
+        ResourceManager,
+        AgentConfig,
+        ProcessPriority,
+        RestartPolicy,
+        ResourceLimits,
+    )
+    PROCESS_MANAGER_AVAILABLE = True
+except ImportError:
+    PROCESS_MANAGER_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -94,6 +111,13 @@ class AIONKernel:
         self._evolution_engine = None
         self._visual_cortex = None
         self._audio_cortex = None
+
+        # Process Manager components
+        self._event_bus = None
+        self._supervisor = None
+        self._scheduler = None
+        self._worker_pool = None
+        self._resource_manager = None
 
         # State
         self._status = SystemStatus.INITIALIZING
@@ -245,6 +269,157 @@ class AIONKernel:
             logger.warning("Visual cortex initialization failed", error=str(e))
             self._update_health("vision", SystemStatus.ERROR, str(e))
 
+        # Initialize Process Manager (core OS layer)
+        if PROCESS_MANAGER_AVAILABLE:
+            await self._initialize_process_manager()
+
+    async def _initialize_process_manager(self) -> None:
+        """Initialize the Process & Agent Manager system."""
+        proc_config = self.config.process
+
+        try:
+            # Initialize Event Bus
+            self._event_bus = EventBus(
+                max_history=proc_config.event_bus_max_history,
+                max_dead_letters=proc_config.event_bus_max_dead_letters,
+                default_ttl_seconds=proc_config.event_bus_default_ttl_seconds,
+            )
+            await self._event_bus.initialize()
+            self._update_health("event_bus", SystemStatus.READY)
+
+            # Initialize Resource Manager
+            self._resource_manager = ResourceManager(
+                system_limits=ResourceLimits(
+                    max_memory_mb=proc_config.default_max_memory_mb,
+                    max_tokens_per_minute=proc_config.default_max_tokens_per_minute,
+                    max_tokens_total=proc_config.default_max_tokens_total,
+                    max_runtime_seconds=proc_config.default_max_runtime_seconds,
+                ),
+                enable_memory_monitoring=proc_config.enable_resource_monitoring,
+            )
+            await self._resource_manager.initialize()
+
+            # Initialize Process Supervisor
+            self._supervisor = ProcessSupervisor(
+                event_bus=self._event_bus,
+                kernel=self,
+                health_check_interval=proc_config.health_check_interval,
+                max_processes=proc_config.max_processes,
+                default_restart_delay=proc_config.default_restart_delay,
+                default_max_restarts=proc_config.default_max_restarts,
+                enable_resource_monitoring=proc_config.enable_resource_monitoring,
+                zombie_timeout_seconds=proc_config.zombie_timeout_seconds,
+            )
+            await self._supervisor.initialize()
+            self._update_health("supervisor", SystemStatus.READY)
+
+            # Initialize Task Scheduler
+            self._scheduler = TaskScheduler(
+                supervisor=self._supervisor,
+                event_bus=self._event_bus,
+                check_interval=proc_config.scheduler_check_interval,
+                max_concurrent_tasks=proc_config.max_concurrent_scheduled_tasks,
+            )
+            await self._scheduler.initialize()
+            self._update_health("scheduler", SystemStatus.READY)
+
+            # Initialize Worker Pool
+            self._worker_pool = WorkerPool(
+                event_bus=self._event_bus,
+                min_workers=proc_config.worker_pool_min_workers,
+                max_workers=proc_config.worker_pool_max_workers,
+                max_queue_size=proc_config.worker_pool_max_queue_size,
+                enable_auto_scaling=proc_config.worker_pool_enable_auto_scaling,
+            )
+            await self._worker_pool.initialize()
+            self._update_health("worker_pool", SystemStatus.READY)
+
+            # Start system agents
+            await self._start_system_agents()
+
+            logger.info("Process Manager initialized successfully")
+
+        except Exception as e:
+            logger.error("Process Manager initialization failed", error=str(e))
+            self._update_health("process_manager", SystemStatus.ERROR, str(e))
+
+    async def _start_system_agents(self) -> None:
+        """Start built-in system agents."""
+        if not self._supervisor:
+            return
+
+        proc_config = self.config.process
+
+        # Health Monitor Agent
+        if proc_config.enable_health_monitor:
+            try:
+                await self._supervisor.spawn_agent(AgentConfig(
+                    name="system_health_monitor",
+                    agent_class="health_monitor",
+                    priority=ProcessPriority.CRITICAL,
+                    restart_policy=RestartPolicy.ALWAYS,
+                    metadata={
+                        "check_interval": proc_config.health_monitor_interval,
+                        "alert_thresholds": {
+                            "memory_percent": proc_config.health_monitor_memory_threshold,
+                            "cpu_percent": proc_config.health_monitor_cpu_threshold,
+                        },
+                    },
+                ))
+                logger.debug("Started health monitor agent")
+            except Exception as e:
+                logger.warning("Failed to start health monitor agent", error=str(e))
+
+        # Garbage Collector Agent
+        if proc_config.enable_garbage_collector:
+            try:
+                await self._supervisor.spawn_agent(AgentConfig(
+                    name="system_gc",
+                    agent_class="garbage_collector",
+                    priority=ProcessPriority.LOW,
+                    restart_policy=RestartPolicy.ALWAYS,
+                    metadata={
+                        "gc_interval": proc_config.gc_interval,
+                        "max_completed_age": proc_config.gc_max_completed_age,
+                    },
+                ))
+                logger.debug("Started garbage collector agent")
+            except Exception as e:
+                logger.warning("Failed to start garbage collector agent", error=str(e))
+
+        # Metrics Collector Agent
+        if proc_config.enable_metrics_collector:
+            try:
+                await self._supervisor.spawn_agent(AgentConfig(
+                    name="system_metrics",
+                    agent_class="metrics_collector",
+                    priority=ProcessPriority.LOW,
+                    restart_policy=RestartPolicy.ALWAYS,
+                    metadata={
+                        "collect_interval": proc_config.metrics_collect_interval,
+                    },
+                ))
+                logger.debug("Started metrics collector agent")
+            except Exception as e:
+                logger.warning("Failed to start metrics collector agent", error=str(e))
+
+        # Watchdog Agent
+        if proc_config.enable_watchdog:
+            try:
+                await self._supervisor.spawn_agent(AgentConfig(
+                    name="system_watchdog",
+                    agent_class="watchdog",
+                    priority=ProcessPriority.HIGH,
+                    restart_policy=RestartPolicy.ALWAYS,
+                    metadata={
+                        "check_interval": proc_config.watchdog_check_interval,
+                        "heartbeat_timeout": proc_config.watchdog_heartbeat_timeout,
+                        "idle_timeout": proc_config.watchdog_idle_timeout,
+                    },
+                ))
+                logger.debug("Started watchdog agent")
+            except Exception as e:
+                logger.warning("Failed to start watchdog agent", error=str(e))
         # Initialize Auditory Cortex
         if self.config.audio.enabled:
             try:
@@ -301,7 +476,19 @@ class AIONKernel:
             )
             await asyncio.sleep(5)  # Give some time for requests to complete
 
-        # Shutdown subsystems
+        # Shutdown process manager first (graceful agent shutdown)
+        if self._supervisor:
+            await self._supervisor.shutdown()
+        if self._scheduler:
+            await self._scheduler.shutdown()
+        if self._worker_pool:
+            await self._worker_pool.shutdown()
+        if self._resource_manager:
+            await self._resource_manager.shutdown()
+        if self._event_bus:
+            await self._event_bus.shutdown()
+
+        # Shutdown cognitive subsystems
         if self._llm:
             await self._llm.close()
         if self._planning_graph:
@@ -619,6 +806,113 @@ Output a JSON array of steps, each with:
         """Get the visual cortex."""
         return self._visual_cortex
 
+    # ==================== Process Manager Access ====================
+
+    @property
+    def event_bus(self):
+        """Get the event bus for pub/sub communication."""
+        return self._event_bus
+
+    @property
+    def supervisor(self):
+        """Get the process supervisor for agent management."""
+        return self._supervisor
+
+    @property
+    def scheduler(self):
+        """Get the task scheduler."""
+        return self._scheduler
+
+    @property
+    def worker_pool(self):
+        """Get the worker pool for background tasks."""
+        return self._worker_pool
+
+    @property
+    def resource_manager(self):
+        """Get the resource manager."""
+        return self._resource_manager
+
+    async def spawn_agent(self, config: "AgentConfig") -> str:
+        """
+        Convenience method to spawn an agent.
+
+        Args:
+            config: Agent configuration
+
+        Returns:
+            Process ID of the spawned agent
+        """
+        if not self._supervisor:
+            raise RuntimeError("Process supervisor not initialized")
+        return await self._supervisor.spawn_agent(config)
+
+    async def schedule_task(
+        self,
+        name: str,
+        handler: str,
+        cron_expression: str = None,
+        interval_seconds: int = None,
+        run_at: datetime = None,
+        params: dict = None,
+    ) -> str:
+        """
+        Convenience method to schedule a task.
+
+        Args:
+            name: Task name
+            handler: Handler function name
+            cron_expression: Cron expression for scheduling
+            interval_seconds: Interval for recurring tasks
+            run_at: Datetime for one-time tasks
+            params: Parameters to pass to handler
+
+        Returns:
+            Task ID
+        """
+        if not self._scheduler:
+            raise RuntimeError("Task scheduler not initialized")
+
+        if cron_expression:
+            return await self._scheduler.schedule_cron(
+                name=name,
+                handler=handler,
+                cron_expression=cron_expression,
+                params=params,
+            )
+        elif interval_seconds:
+            return await self._scheduler.schedule_interval(
+                name=name,
+                handler=handler,
+                interval_seconds=interval_seconds,
+                params=params,
+            )
+        elif run_at:
+            return await self._scheduler.schedule_once(
+                name=name,
+                handler=handler,
+                run_at=run_at,
+                params=params,
+            )
+        else:
+            raise ValueError("Must specify cron_expression, interval_seconds, or run_at")
+
+    def get_process_stats(self) -> dict[str, Any]:
+        """Get comprehensive process manager statistics."""
+        stats = {}
+
+        if self._supervisor:
+            stats["supervisor"] = self._supervisor.get_stats()
+        if self._scheduler:
+            stats["scheduler"] = self._scheduler.get_stats()
+        if self._worker_pool:
+            stats["worker_pool"] = self._worker_pool.get_stats()
+        if self._event_bus:
+            stats["event_bus"] = self._event_bus.get_stats()
+        if self._resource_manager:
+            stats["resources"] = self._resource_manager.get_stats()
+
+        return stats
     @property
     def audio(self):
         """Get the auditory cortex."""
