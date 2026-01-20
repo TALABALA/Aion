@@ -1257,3 +1257,700 @@ class SWIMProtocol:
             "dead_members": len([m for m in self._members.values() if m.state == SWIMState.DEAD]),
             "incarnation": self.incarnation,
         }
+
+
+# === Joint Consensus for Membership Changes ===
+
+class ConfigurationState(Enum):
+    """Configuration state for joint consensus."""
+    STABLE = auto()      # C_old - single configuration
+    JOINT = auto()       # C_old,new - joint configuration
+    TRANSITIONING = auto()  # Transitioning to C_new
+
+
+@dataclass
+class ClusterConfiguration:
+    """Cluster configuration for membership changes."""
+    config_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    members: Set[str] = field(default_factory=set)
+    learners: Set[str] = field(default_factory=set)  # Non-voting members
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def voting_members(self) -> Set[str]:
+        """Get voting members (excludes learners)."""
+        return self.members - self.learners
+
+    def majority_size(self) -> int:
+        """Get majority size for this configuration."""
+        return len(self.voting_members()) // 2 + 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "config_id": self.config_id,
+            "members": list(self.members),
+            "learners": list(self.learners),
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ClusterConfiguration":
+        return cls(
+            config_id=data["config_id"],
+            members=set(data["members"]),
+            learners=set(data.get("learners", [])),
+            created_at=datetime.fromisoformat(data["created_at"]),
+        )
+
+
+@dataclass
+class JointConfiguration:
+    """Joint configuration for safe membership changes."""
+    old_config: ClusterConfiguration
+    new_config: ClusterConfiguration
+    state: ConfigurationState = ConfigurationState.JOINT
+
+    def requires_majority_in_both(self, votes: Set[str]) -> bool:
+        """Check if votes form a majority in BOTH configurations."""
+        old_majority = len(votes & self.old_config.voting_members()) >= self.old_config.majority_size()
+        new_majority = len(votes & self.new_config.voting_members()) >= self.new_config.majority_size()
+        return old_majority and new_majority
+
+
+@dataclass
+class AddServerRequest:
+    """Request to add a server to the cluster."""
+    server_id: str
+    server_address: str
+    as_learner: bool = True  # Start as non-voting learner
+
+
+@dataclass
+class AddServerResponse:
+    """Response to add server request."""
+    success: bool
+    leader_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class RemoveServerRequest:
+    """Request to remove a server from the cluster."""
+    server_id: str
+
+
+@dataclass
+class RemoveServerResponse:
+    """Response to remove server request."""
+    success: bool
+    leader_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class MembershipManager:
+    """
+    Manages cluster membership changes using joint consensus.
+
+    Implements the Raft joint consensus protocol:
+    1. Leader receives AddServer/RemoveServer
+    2. If adding: catch up new server as learner first
+    3. Create joint configuration (C_old,new)
+    4. Replicate and commit joint configuration
+    5. Create new configuration (C_new)
+    6. Replicate and commit new configuration
+    7. Remove old members if needed
+    """
+
+    def __init__(self, raft_node: RaftNode):
+        self.raft_node = raft_node
+        self.current_config = ClusterConfiguration(
+            members={raft_node.node_id} | raft_node.peers
+        )
+        self.pending_config: Optional[JointConfiguration] = None
+        self._config_change_in_progress = False
+
+        # Learner catch-up tracking
+        self._learner_progress: Dict[str, int] = {}
+        self._catch_up_threshold = 100  # Max entries behind before promotion
+
+    async def add_server(self, request: AddServerRequest) -> AddServerResponse:
+        """Add a new server to the cluster."""
+        if self.raft_node.state != RaftState.LEADER:
+            return AddServerResponse(
+                success=False,
+                leader_id=self.raft_node.leader_id,
+                error="Not leader",
+            )
+
+        if self._config_change_in_progress:
+            return AddServerResponse(
+                success=False,
+                error="Configuration change already in progress",
+            )
+
+        if request.server_id in self.current_config.members:
+            return AddServerResponse(
+                success=False,
+                error=f"Server {request.server_id} already in cluster",
+            )
+
+        self._config_change_in_progress = True
+
+        try:
+            # Step 1: Add as learner first
+            if request.as_learner:
+                await self._add_learner(request.server_id, request.server_address)
+
+                # Step 2: Wait for learner to catch up
+                if not await self._wait_for_catch_up(request.server_id):
+                    return AddServerResponse(
+                        success=False,
+                        error="Learner failed to catch up",
+                    )
+
+            # Step 3: Create joint configuration
+            new_config = ClusterConfiguration(
+                members=self.current_config.members | {request.server_id},
+                learners=self.current_config.learners - {request.server_id},
+            )
+
+            joint = JointConfiguration(
+                old_config=self.current_config,
+                new_config=new_config,
+            )
+
+            # Step 4: Propose joint configuration
+            await self.raft_node.propose({
+                "type": "config_change",
+                "phase": "joint",
+                "old_config": self.current_config.to_dict(),
+                "new_config": new_config.to_dict(),
+            })
+
+            self.pending_config = joint
+
+            # Step 5: Propose new configuration
+            await self.raft_node.propose({
+                "type": "config_change",
+                "phase": "new",
+                "config": new_config.to_dict(),
+            })
+
+            # Step 6: Update current configuration
+            self.current_config = new_config
+            self.pending_config = None
+
+            # Update Raft node peers
+            self.raft_node.peers.add(request.server_id)
+
+            return AddServerResponse(success=True)
+
+        except Exception as e:
+            logger.error(f"Failed to add server: {e}")
+            return AddServerResponse(success=False, error=str(e))
+
+        finally:
+            self._config_change_in_progress = False
+
+    async def remove_server(self, request: RemoveServerRequest) -> RemoveServerResponse:
+        """Remove a server from the cluster."""
+        if self.raft_node.state != RaftState.LEADER:
+            return RemoveServerResponse(
+                success=False,
+                leader_id=self.raft_node.leader_id,
+                error="Not leader",
+            )
+
+        if self._config_change_in_progress:
+            return RemoveServerResponse(
+                success=False,
+                error="Configuration change already in progress",
+            )
+
+        if request.server_id not in self.current_config.members:
+            return RemoveServerResponse(
+                success=False,
+                error=f"Server {request.server_id} not in cluster",
+            )
+
+        self._config_change_in_progress = True
+
+        try:
+            # Create new configuration without the server
+            new_config = ClusterConfiguration(
+                members=self.current_config.members - {request.server_id},
+                learners=self.current_config.learners - {request.server_id},
+            )
+
+            # Create and commit joint configuration
+            joint = JointConfiguration(
+                old_config=self.current_config,
+                new_config=new_config,
+            )
+
+            await self.raft_node.propose({
+                "type": "config_change",
+                "phase": "joint",
+                "old_config": self.current_config.to_dict(),
+                "new_config": new_config.to_dict(),
+            })
+
+            self.pending_config = joint
+
+            # Commit new configuration
+            await self.raft_node.propose({
+                "type": "config_change",
+                "phase": "new",
+                "config": new_config.to_dict(),
+            })
+
+            self.current_config = new_config
+            self.pending_config = None
+
+            # Update Raft node peers
+            self.raft_node.peers.discard(request.server_id)
+
+            # If we removed ourselves, step down
+            if request.server_id == self.raft_node.node_id:
+                self.raft_node._become_follower()
+
+            return RemoveServerResponse(success=True)
+
+        except Exception as e:
+            logger.error(f"Failed to remove server: {e}")
+            return RemoveServerResponse(success=False, error=str(e))
+
+        finally:
+            self._config_change_in_progress = False
+
+    async def _add_learner(self, server_id: str, address: str) -> None:
+        """Add a server as a non-voting learner."""
+        self.current_config.learners.add(server_id)
+        self.current_config.members.add(server_id)
+
+        # Initialize replication state
+        self.raft_node.next_index[server_id] = self.raft_node.log.last_index() + 1
+        self.raft_node.match_index[server_id] = 0
+
+        self._learner_progress[server_id] = 0
+
+        logger.info(f"Added {server_id} as learner")
+
+    async def _wait_for_catch_up(self, server_id: str, timeout: float = 30.0) -> bool:
+        """Wait for a learner to catch up with the leader."""
+        start = time.time()
+
+        while time.time() - start < timeout:
+            # Check progress
+            match_index = self.raft_node.match_index.get(server_id, 0)
+            leader_index = self.raft_node.log.last_index()
+
+            if leader_index - match_index <= self._catch_up_threshold:
+                logger.info(f"Learner {server_id} caught up")
+                return True
+
+            # Trigger replication
+            if self.raft_node.send_append_entries:
+                await self.raft_node._replicate_to_peer(server_id)
+
+            await asyncio.sleep(0.1)
+
+        logger.warning(f"Learner {server_id} failed to catch up within timeout")
+        return False
+
+    def has_majority(self, votes: Set[str]) -> bool:
+        """Check if votes form a majority under current configuration."""
+        if self.pending_config:
+            # Joint consensus: need majority in both old and new
+            return self.pending_config.requires_majority_in_both(votes)
+        else:
+            # Single configuration
+            return len(votes & self.current_config.voting_members()) >= self.current_config.majority_size()
+
+    def apply_config_change(self, command: Dict[str, Any]) -> None:
+        """Apply a configuration change from the log."""
+        phase = command.get("phase")
+
+        if phase == "joint":
+            # Entering joint consensus
+            old_config = ClusterConfiguration.from_dict(command["old_config"])
+            new_config = ClusterConfiguration.from_dict(command["new_config"])
+            self.pending_config = JointConfiguration(old_config, new_config)
+            logger.info("Entered joint consensus configuration")
+
+        elif phase == "new":
+            # Transitioning to new configuration
+            self.current_config = ClusterConfiguration.from_dict(command["config"])
+            self.pending_config = None
+            logger.info(f"Committed new configuration: {self.current_config.members}")
+
+
+# === Pipelining Support ===
+
+class PipelinedReplicator:
+    """
+    Pipelined log replication for high throughput.
+
+    Instead of waiting for each AppendEntries response,
+    sends multiple batches in flight.
+    """
+
+    def __init__(
+        self,
+        raft_node: RaftNode,
+        max_in_flight: int = 10,
+        batch_size: int = 100,
+    ):
+        self.raft_node = raft_node
+        self.max_in_flight = max_in_flight
+        self.batch_size = batch_size
+
+        # Per-peer state
+        self._in_flight: Dict[str, int] = {}  # peer -> count of in-flight batches
+        self._inflight_ranges: Dict[str, List[Tuple[int, int]]] = {}  # peer -> [(start, end), ...]
+
+    async def replicate_to_peer(self, peer: str) -> None:
+        """Replicate to a peer using pipelining."""
+        if self._in_flight.get(peer, 0) >= self.max_in_flight:
+            return  # Too many in flight
+
+        next_idx = self.raft_node.next_index.get(peer, 1)
+        last_idx = self.raft_node.log.last_index()
+
+        if next_idx > last_idx:
+            # Nothing to replicate, send heartbeat
+            await self._send_heartbeat(peer)
+            return
+
+        # Send batches up to max_in_flight
+        while (
+            self._in_flight.get(peer, 0) < self.max_in_flight and
+            next_idx <= last_idx
+        ):
+            batch_end = min(next_idx + self.batch_size, last_idx + 1)
+
+            # Send batch asynchronously
+            asyncio.create_task(
+                self._send_batch(peer, next_idx, batch_end)
+            )
+
+            self._in_flight[peer] = self._in_flight.get(peer, 0) + 1
+            if peer not in self._inflight_ranges:
+                self._inflight_ranges[peer] = []
+            self._inflight_ranges[peer].append((next_idx, batch_end))
+
+            next_idx = batch_end
+
+    async def _send_batch(self, peer: str, start_idx: int, end_idx: int) -> None:
+        """Send a batch of entries."""
+        try:
+            prev_idx = start_idx - 1
+            prev_term = self.raft_node.log.term_at(prev_idx)
+            entries = self.raft_node.log.get_range(start_idx, end_idx)
+
+            request = AppendEntriesRequest(
+                term=self.raft_node.current_term,
+                leader_id=self.raft_node.node_id,
+                prev_log_index=prev_idx,
+                prev_log_term=prev_term,
+                entries=entries,
+                leader_commit=self.raft_node.commit_index,
+            )
+
+            if self.raft_node.send_append_entries:
+                response = await self.raft_node.send_append_entries(peer, request)
+                await self._handle_response(peer, start_idx, end_idx, response)
+
+        except Exception as e:
+            logger.debug(f"Pipelined batch to {peer} failed: {e}")
+
+        finally:
+            self._in_flight[peer] = max(0, self._in_flight.get(peer, 0) - 1)
+            if peer in self._inflight_ranges:
+                self._inflight_ranges[peer] = [
+                    r for r in self._inflight_ranges[peer]
+                    if r != (start_idx, end_idx)
+                ]
+
+    async def _handle_response(
+        self,
+        peer: str,
+        start_idx: int,
+        end_idx: int,
+        response: AppendEntriesResponse,
+    ) -> None:
+        """Handle response from pipelined batch."""
+        if response.term > self.raft_node.current_term:
+            self.raft_node.current_term = response.term
+            self.raft_node._become_follower()
+            return
+
+        if response.success:
+            # Update match_index to highest confirmed
+            current_match = self.raft_node.match_index.get(peer, 0)
+            new_match = max(current_match, end_idx - 1)
+            self.raft_node.match_index[peer] = new_match
+
+            # Update next_index
+            self.raft_node.next_index[peer] = max(
+                self.raft_node.next_index.get(peer, 1),
+                end_idx,
+            )
+
+            # Update commit index
+            self.raft_node._update_commit_index()
+
+        else:
+            # Conflict - need to backtrack
+            if response.conflict_term:
+                self.raft_node.next_index[peer] = response.conflict_index
+            else:
+                self.raft_node.next_index[peer] = max(1, start_idx - 1)
+
+            # Cancel other in-flight requests for this peer
+            self._inflight_ranges[peer] = []
+
+    async def _send_heartbeat(self, peer: str) -> None:
+        """Send empty AppendEntries as heartbeat."""
+        request = AppendEntriesRequest(
+            term=self.raft_node.current_term,
+            leader_id=self.raft_node.node_id,
+            prev_log_index=self.raft_node.log.last_index(),
+            prev_log_term=self.raft_node.log.last_term(),
+            entries=[],
+            leader_commit=self.raft_node.commit_index,
+        )
+
+        if self.raft_node.send_append_entries:
+            try:
+                response = await self.raft_node.send_append_entries(peer, request)
+                if response.term > self.raft_node.current_term:
+                    self.raft_node.current_term = response.term
+                    self.raft_node._become_follower()
+            except Exception:
+                pass
+
+
+# === Enhanced SWIM with Piggybacked Gossip ===
+
+class GossipMessageType(Enum):
+    """Types of gossip messages."""
+    ALIVE = auto()
+    SUSPECT = auto()
+    DEAD = auto()
+    JOIN = auto()
+    LEAVE = auto()
+
+
+@dataclass
+class GossipMessage:
+    """A gossip message for membership updates."""
+    msg_type: GossipMessageType
+    member_id: str
+    incarnation: int
+    address: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.msg_type.name,
+            "member_id": self.member_id,
+            "incarnation": self.incarnation,
+            "address": self.address,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GossipMessage":
+        return cls(
+            msg_type=GossipMessageType[data["type"]],
+            member_id=data["member_id"],
+            incarnation=data["incarnation"],
+            address=data.get("address", ""),
+            timestamp=data.get("timestamp", time.time()),
+        )
+
+
+class EnhancedSWIMProtocol(SWIMProtocol):
+    """
+    Enhanced SWIM with piggybacked gossip.
+
+    Improvements over basic SWIM:
+    - Piggybacks membership updates on ping/ack messages
+    - Bounded gossip buffer with priority
+    - Dissemination tracking for reliable delivery
+    """
+
+    def __init__(
+        self,
+        node_id: str,
+        address: str,
+        ping_interval: float = 1.0,
+        ping_timeout: float = 0.5,
+        suspect_timeout: float = 3.0,
+        ping_indirect_count: int = 3,
+        gossip_fanout: int = 3,  # Number of members to gossip to
+        max_gossip_buffer: int = 100,
+        gossip_retransmit_mult: int = 3,  # Retransmit mult * log(N) times
+    ):
+        super().__init__(
+            node_id, address, ping_interval, ping_timeout,
+            suspect_timeout, ping_indirect_count
+        )
+        self.gossip_fanout = gossip_fanout
+        self.max_gossip_buffer = max_gossip_buffer
+        self.gossip_retransmit_mult = gossip_retransmit_mult
+
+        # Gossip buffer with transmission counts
+        self._gossip_buffer: deque[Tuple[GossipMessage, int]] = deque(
+            maxlen=max_gossip_buffer
+        )
+
+        # Track which messages each member has seen
+        self._member_gossip_state: Dict[str, Set[str]] = {}
+
+    def _max_transmissions(self) -> int:
+        """Calculate max transmissions based on cluster size."""
+        import math
+        n = len(self._members) + 1
+        return self.gossip_retransmit_mult * int(math.ceil(math.log2(max(n, 2))))
+
+    def queue_gossip(self, message: GossipMessage) -> None:
+        """Queue a gossip message for dissemination."""
+        self._gossip_buffer.append((message, 0))
+
+    def get_gossip_payload(self, target: str) -> List[Dict[str, Any]]:
+        """Get gossip messages to piggyback on a message to target."""
+        payload = []
+        new_buffer = deque(maxlen=self.max_gossip_buffer)
+
+        for msg, count in self._gossip_buffer:
+            # Create unique message ID
+            msg_id = f"{msg.member_id}:{msg.incarnation}:{msg.msg_type.name}"
+
+            # Check if target has seen this
+            target_seen = self._member_gossip_state.get(target, set())
+            if msg_id not in target_seen:
+                payload.append(msg.to_dict())
+
+                # Mark as sent to target
+                if target not in self._member_gossip_state:
+                    self._member_gossip_state[target] = set()
+                self._member_gossip_state[target].add(msg_id)
+
+            # Keep in buffer if not fully disseminated
+            if count < self._max_transmissions():
+                new_buffer.append((msg, count + 1))
+
+        self._gossip_buffer = new_buffer
+        return payload[:self.gossip_fanout]  # Limit payload size
+
+    def process_gossip_payload(self, payload: List[Dict[str, Any]]) -> None:
+        """Process received gossip messages."""
+        for msg_dict in payload:
+            msg = GossipMessage.from_dict(msg_dict)
+            self._process_gossip_message(msg)
+
+    def _process_gossip_message(self, msg: GossipMessage) -> None:
+        """Process a single gossip message."""
+        member = self._members.get(msg.member_id)
+
+        if msg.msg_type == GossipMessageType.ALIVE:
+            if member:
+                if msg.incarnation > member.incarnation:
+                    member.incarnation = msg.incarnation
+                    member.state = SWIMState.ALIVE
+                    member.last_update = datetime.now()
+
+                    # Cancel any suspect timer
+                    timer = self._suspect_timers.pop(msg.member_id, None)
+                    if timer:
+                        timer.cancel()
+            else:
+                # New member joining
+                self._members[msg.member_id] = SWIMMember(
+                    id=msg.member_id,
+                    address=msg.address,
+                    state=SWIMState.ALIVE,
+                    incarnation=msg.incarnation,
+                )
+                for callback in self._on_join:
+                    try:
+                        callback(self._members[msg.member_id])
+                    except Exception:
+                        pass
+
+        elif msg.msg_type == GossipMessageType.SUSPECT:
+            if member and msg.incarnation >= member.incarnation:
+                if member.state == SWIMState.ALIVE:
+                    self._start_suspect_timer(msg.member_id)
+
+                # If it's us, refute!
+                if msg.member_id == self.node_id:
+                    self.refute()
+                    self.queue_gossip(GossipMessage(
+                        msg_type=GossipMessageType.ALIVE,
+                        member_id=self.node_id,
+                        incarnation=self.incarnation,
+                        address=self.address,
+                    ))
+
+        elif msg.msg_type == GossipMessageType.DEAD:
+            if member and msg.incarnation >= member.incarnation:
+                self._handle_dead(msg.member_id)
+
+        elif msg.msg_type == GossipMessageType.JOIN:
+            if msg.member_id not in self._members:
+                self._members[msg.member_id] = SWIMMember(
+                    id=msg.member_id,
+                    address=msg.address,
+                    state=SWIMState.ALIVE,
+                    incarnation=msg.incarnation,
+                )
+                self._ping_targets.append(msg.member_id)
+
+        elif msg.msg_type == GossipMessageType.LEAVE:
+            if member:
+                self._handle_dead(msg.member_id)
+                del self._members[msg.member_id]
+
+    def broadcast_join(self) -> None:
+        """Broadcast that we're joining the cluster."""
+        self.queue_gossip(GossipMessage(
+            msg_type=GossipMessageType.JOIN,
+            member_id=self.node_id,
+            incarnation=self.incarnation,
+            address=self.address,
+        ))
+
+    def broadcast_leave(self) -> None:
+        """Broadcast that we're leaving the cluster."""
+        self.queue_gossip(GossipMessage(
+            msg_type=GossipMessageType.LEAVE,
+            member_id=self.node_id,
+            incarnation=self.incarnation,
+        ))
+
+    def _start_suspect_timer(self, member_id: str) -> None:
+        """Override to also queue gossip."""
+        super()._start_suspect_timer(member_id)
+
+        # Queue suspect gossip
+        member = self._members.get(member_id)
+        if member:
+            self.queue_gossip(GossipMessage(
+                msg_type=GossipMessageType.SUSPECT,
+                member_id=member_id,
+                incarnation=member.incarnation,
+            ))
+
+    def _handle_dead(self, member_id: str) -> None:
+        """Override to also queue gossip."""
+        member = self._members.get(member_id)
+        if member:
+            self.queue_gossip(GossipMessage(
+                msg_type=GossipMessageType.DEAD,
+                member_id=member_id,
+                incarnation=member.incarnation,
+            ))
+
+        super()._handle_dead(member_id)

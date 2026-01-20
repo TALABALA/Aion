@@ -337,6 +337,75 @@ from aion.systems.process.advanced_patterns import (
     BackfillOperation,
 )
 
+# === PRODUCTION-GRADE ADDITIONS ===
+
+# Write-Ahead Log
+from aion.systems.process.wal import (
+    WriteAheadLog,
+    WALRecord,
+    RecordType,
+    WALCorruptionError,
+    WALCheckpoint,
+    CheckpointManager,
+)
+
+# Raft Transport
+from aion.systems.process.raft_transport import (
+    RaftTransport,
+    TCPRaftTransport,
+    RaftMessage,
+    MessageType as RaftMessageType,
+    ConnectionConfig,
+    ConnectionPool,
+    TCPConnection,
+)
+
+# Membership Changes (Joint Consensus)
+from aion.systems.process.consensus import (
+    MembershipManager,
+    ClusterConfiguration,
+    JointConfiguration,
+    ConfigurationState,
+    AddServerRequest,
+    AddServerResponse,
+    RemoveServerRequest,
+    RemoveServerResponse,
+    PipelinedReplicator,
+    GossipMessage,
+    GossipMessageType,
+    EnhancedSWIMProtocol,
+)
+
+# Multi-Raft
+from aion.systems.process.multi_raft import (
+    MultiRaftNode,
+    RaftGroup,
+    RaftGroupConfig,
+    MultiRaftRouter,
+    PartitionInfo,
+    PartitionState,
+    TransactionCoordinator,
+    DistributedTransaction,
+    TransactionState,
+    PartitionManager,
+)
+
+# CRDTs
+from aion.systems.process.crdt import (
+    CRDT,
+    GCounter,
+    PNCounter,
+    LWWRegister,
+    MVRegister,
+    GSet,
+    TwoPSet,
+    ORSet,
+    LWWMap,
+    RGA,
+    CRDTManager,
+    Timestamp,
+)
+
 __all__ = [
     # === Core ===
     # State enums
@@ -527,6 +596,65 @@ __all__ = [
     "DynamicDAG",
     "DynamicTask",
     "BackfillOperation",
+
+    # === PRODUCTION-GRADE ADDITIONS ===
+
+    # Write-Ahead Log
+    "WriteAheadLog",
+    "WALRecord",
+    "RecordType",
+    "WALCorruptionError",
+    "WALCheckpoint",
+    "CheckpointManager",
+
+    # Raft Transport
+    "RaftTransport",
+    "TCPRaftTransport",
+    "RaftMessage",
+    "RaftMessageType",
+    "ConnectionConfig",
+    "ConnectionPool",
+    "TCPConnection",
+
+    # Membership Changes (Joint Consensus)
+    "MembershipManager",
+    "ClusterConfiguration",
+    "JointConfiguration",
+    "ConfigurationState",
+    "AddServerRequest",
+    "AddServerResponse",
+    "RemoveServerRequest",
+    "RemoveServerResponse",
+    "PipelinedReplicator",
+    "GossipMessage",
+    "GossipMessageType",
+    "EnhancedSWIMProtocol",
+
+    # Multi-Raft
+    "MultiRaftNode",
+    "RaftGroup",
+    "RaftGroupConfig",
+    "MultiRaftRouter",
+    "PartitionInfo",
+    "PartitionState",
+    "TransactionCoordinator",
+    "DistributedTransaction",
+    "TransactionState",
+    "PartitionManager",
+
+    # CRDTs
+    "CRDT",
+    "GCounter",
+    "PNCounter",
+    "LWWRegister",
+    "MVRegister",
+    "GSet",
+    "TwoPSet",
+    "ORSet",
+    "LWWMap",
+    "RGA",
+    "CRDTManager",
+    "Timestamp",
 ]
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
