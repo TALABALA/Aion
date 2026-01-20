@@ -110,6 +110,7 @@ class AIONKernel:
         self._tool_orchestrator = None
         self._evolution_engine = None
         self._visual_cortex = None
+        self._audio_cortex = None
 
         # Process Manager components
         self._event_bus = None
@@ -204,6 +205,7 @@ class AIONKernel:
         from aion.systems.tools import ToolOrchestrator
         from aion.systems.evolution import SelfImprovementEngine
         from aion.systems.vision import VisualCortex
+        from aion.systems.audio import AuditoryCortex, AuditoryCortexConfig
 
         # Initialize Planning Graph
         try:
@@ -418,6 +420,34 @@ class AIONKernel:
                 logger.debug("Started watchdog agent")
             except Exception as e:
                 logger.warning("Failed to start watchdog agent", error=str(e))
+        # Initialize Auditory Cortex
+        if self.config.audio.enabled:
+            try:
+                audio_config = AuditoryCortexConfig(
+                    whisper_model=self.config.audio.whisper_model,
+                    event_detection_model=self.config.audio.event_detection_model,
+                    speaker_embedding_model=self.config.audio.speaker_embedding_model,
+                    clap_model=self.config.audio.clap_model,
+                    tts_model=self.config.audio.tts_model,
+                    enable_tts=self.config.audio.enable_tts,
+                    enable_diarization=self.config.audio.enable_diarization,
+                    diarization_model=self.config.audio.diarization_model,
+                    enable_memory=self.config.audio.enable_memory,
+                    memory_embedding_dim=self.config.audio.memory_embedding_dim,
+                    memory_max_entries=self.config.audio.memory_max_entries,
+                    memory_index_path=self.config.audio.memory_index_path,
+                    device=self.config.audio.device,
+                    target_sample_rate=self.config.audio.target_sample_rate,
+                    max_audio_duration=self.config.audio.max_audio_duration,
+                    enable_music_analysis=self.config.audio.enable_music_analysis,
+                    event_threshold=self.config.audio.event_threshold,
+                )
+                self._audio_cortex = AuditoryCortex(config=audio_config)
+                await self._audio_cortex.initialize()
+                self._update_health("audio", SystemStatus.READY)
+            except Exception as e:
+                logger.warning("Auditory cortex initialization failed", error=str(e))
+                self._update_health("audio", SystemStatus.ERROR, str(e))
 
     def _update_health(
         self,
@@ -471,6 +501,8 @@ class AIONKernel:
             await self._evolution_engine.shutdown()
         if self._visual_cortex:
             await self._visual_cortex.shutdown()
+        if self._audio_cortex:
+            await self._audio_cortex.shutdown()
 
         logger.info("AION Kernel shutdown complete")
 
@@ -676,6 +708,18 @@ Output a JSON array of steps, each with:
                 )
                 results.append(result)
 
+            elif step_type == "audio" and self._audio_cortex:
+                result = await self._audio_cortex.understand_scene(
+                    audio=step.get("audio", ""),
+                )
+                results.append(result)
+
+            elif step_type == "transcribe" and self._audio_cortex:
+                result = await self._audio_cortex.transcribe(
+                    audio=step.get("audio", ""),
+                )
+                results.append(result)
+
             elif step_type == "reason" and self._llm:
                 messages = [Message(role="user", content=step.get("content", ""))]
                 response = await self._llm.complete(messages)
@@ -869,3 +913,7 @@ Output a JSON array of steps, each with:
             stats["resources"] = self._resource_manager.get_stats()
 
         return stats
+    @property
+    def audio(self):
+        """Get the auditory cortex."""
+        return self._audio_cortex
