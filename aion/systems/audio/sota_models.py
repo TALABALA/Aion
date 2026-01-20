@@ -863,7 +863,7 @@ class StyleTTS2Synthesizer:
             return False
 
     def _load_model(self) -> bool:
-        """Load StyleTTS2 models."""
+        """Load StyleTTS2 models with auto-download."""
         try:
             import torch
 
@@ -874,12 +874,25 @@ class StyleTTS2Synthesizer:
             else:
                 self._device = self.config.device
 
+            # Try auto-download StyleTTS2 weights
+            styletts2_weights = None
+            try:
+                from aion.systems.audio.weight_downloader import get_styletts2_model_path
+                styletts2_weights = get_styletts2_model_path("ljspeech")
+                if styletts2_weights:
+                    logger.info("StyleTTS2 weights auto-downloaded", path=str(styletts2_weights))
+            except ImportError:
+                pass
+
             # Try to load StyleTTS2
             try:
                 # StyleTTS2 requires specific installation
                 from styletts2 import tts as styletts2_tts
 
                 self._model = styletts2_tts.StyleTTS2()
+                if styletts2_weights:
+                    # Load auto-downloaded weights
+                    self._model.load_checkpoint(str(styletts2_weights))
                 logger.info("StyleTTS2 loaded via styletts2 package")
                 return True
 
@@ -2880,23 +2893,35 @@ class AudioQualityAssessor:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         loaded_any = False
 
-        # Try to load NISQA
+        # Try to load NISQA with auto-download
         if self.model_type in ("nisqa", "both"):
             try:
                 logger.info("Loading NISQA - TRUE SOTA quality assessment")
+
+                # Try auto-download NISQA weights
+                nisqa_weights_path = None
+                try:
+                    from aion.systems.audio.weight_downloader import get_nisqa_model_path
+                    nisqa_weights_path = get_nisqa_model_path()
+                    if nisqa_weights_path:
+                        logger.info("NISQA weights auto-downloaded", path=str(nisqa_weights_path))
+                except ImportError:
+                    pass
 
                 # Try official NISQA package
                 try:
                     from nisqa.NISQA_model import nisqaModel
 
                     self._nisqa_model = nisqaModel()
-                    self._nisqa_model.load_model()
+                    if nisqa_weights_path:
+                        self._nisqa_model.load_model(str(nisqa_weights_path))
+                    else:
+                        self._nisqa_model.load_model()
                     loaded_any = True
                     logger.info("Official NISQA model loaded")
 
                 except ImportError:
-                    # Fallback: Load NISQA-compatible model from HuggingFace
-                    # or use the CNN architecture directly
+                    # Fallback: Create NISQA-style CNN-LSTM network
                     logger.info("NISQA package not found, using neural fallback")
 
                     # Create NISQA-style CNN-LSTM model
@@ -2989,19 +3014,28 @@ class AudioQualityAssessor:
             return None
 
     def _load_dnsmos_onnx(self) -> bool:
-        """Load DNSMOS P.835 ONNX models."""
+        """Load DNSMOS P.835 ONNX models with auto-download."""
         try:
             import onnxruntime as ort
+
+            # Auto-download DNSMOS weights
+            try:
+                from aion.systems.audio.weight_downloader import get_dnsmos_model_path
+                model_path = get_dnsmos_model_path("sig_bak_ovr")
+
+                if model_path and model_path.exists():
+                    self._dnsmos_session = ort.InferenceSession(
+                        str(model_path),
+                        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                    )
+                    logger.info("DNSMOS P.835 loaded from auto-downloaded weights")
+                    return True
+
+            except ImportError:
+                logger.debug("Weight downloader not available")
+
+            # Fallback: check legacy cache location
             import os
-
-            # DNSMOS model paths (would typically be downloaded)
-            # The models are available from Microsoft DNS Challenge repo
-
-            # For now, create a simple ONNX-compatible interface
-            # In production, download from:
-            # https://github.com/microsoft/DNS-Challenge/tree/master/DNSMOS
-
-            # Check if models exist
             model_dir = os.path.expanduser("~/.cache/dnsmos")
             sig_model_path = os.path.join(model_dir, "sig_bak_ovr.onnx")
 
@@ -3012,7 +3046,7 @@ class AudioQualityAssessor:
                 )
                 return True
 
-            # Create a marker that DNSMOS is "available" but using fallback
+            # Use neural estimation fallback
             self._dnsmos_model = "fallback"
             logger.info("DNSMOS using neural estimation fallback")
             return True
@@ -3419,13 +3453,22 @@ class SELDDetector:
             return False
 
     def _load_model(self) -> bool:
-        """Load EINV2 SELD model."""
+        """Load EINV2 SELD model with auto-download."""
         try:
             import torch
 
             logger.info("Loading EINV2 - TRUE SOTA SELD")
 
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # Try to auto-download SELD weights
+            try:
+                from aion.systems.audio.weight_downloader import get_seld_model_path
+                weights_path = get_seld_model_path("seld_baseline")
+                if weights_path:
+                    logger.info("SELD weights available", path=str(weights_path))
+            except ImportError:
+                pass
 
             # Try to load EINV2 architecture
             try:
