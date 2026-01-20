@@ -11,9 +11,26 @@ import zipfile
 import tarfile
 from pathlib import Path
 from typing import Optional, Callable
-import structlog
+try:
+    import structlog
+    logger = structlog.get_logger(__name__)
+    _USE_STRUCTLOG = True
+except ImportError:
+    # Fallback to standard logging
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    _USE_STRUCTLOG = False
 
-logger = structlog.get_logger(__name__)
+
+def _log(level: str, msg: str, **kwargs):
+    """Log with structlog-style kwargs or standard logging."""
+    if _USE_STRUCTLOG:
+        getattr(logger, level)(msg, **kwargs)
+    else:
+        if kwargs:
+            msg = f"{msg} {kwargs}"
+        getattr(logger, level)(msg)
 
 # Default cache directory
 CACHE_DIR = Path(os.environ.get("AION_CACHE_DIR", os.path.expanduser("~/.cache/aion")))
@@ -47,7 +64,7 @@ def download_file(
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Downloading", url=url, dest=str(dest_path))
+        _log("info", "Downloading", url=url, dest=str(dest_path))
 
         # Download with progress
         def reporthook(block_num, block_size, total_size):
@@ -61,15 +78,15 @@ def download_file(
         if expected_hash:
             actual_hash = hashlib.sha256(dest_path.read_bytes()).hexdigest()
             if actual_hash != expected_hash:
-                logger.error("Hash mismatch", expected=expected_hash, actual=actual_hash)
+                _log("error", "Hash mismatch", expected=expected_hash, actual=actual_hash)
                 dest_path.unlink()
                 return False
 
-        logger.info("Download complete", path=str(dest_path))
+        _log("info", "Download complete", path=str(dest_path))
         return True
 
     except Exception as e:
-        logger.error("Download failed", url=url, error=str(e))
+        _log("error", "Download failed", url=url, error=str(e))
         if dest_path.exists():
             dest_path.unlink()
         return False
@@ -85,11 +102,11 @@ def extract_archive(archive_path: Path, dest_dir: Path) -> bool:
             with tarfile.open(archive_path, 'r:*') as tf:
                 tf.extractall(dest_dir)
         else:
-            logger.warning("Unknown archive format", path=str(archive_path))
+            _log("warning", "Unknown archive format", path=str(archive_path))
             return False
         return True
     except Exception as e:
-        logger.error("Extraction failed", error=str(e))
+        _log("error", "Extraction failed", error=str(e))
         return False
 
 
@@ -121,7 +138,7 @@ def get_dnsmos_model_path(model_name: str = "sig_bak_ovr") -> Optional[Path]:
 
     url = DNSMOS_URLS.get(model_name)
     if not url:
-        logger.error("Unknown DNSMOS model", model=model_name)
+        _log("error", "Unknown DNSMOS model", model=model_name)
         return None
 
     if download_file(url, model_path):
@@ -169,10 +186,10 @@ def get_nisqa_model_path() -> Optional[Path]:
                     archive_path.unlink()  # Cleanup archive
                     return weights_dir
         except Exception as e:
-            logger.warning(f"NISQA download attempt failed: {e}")
+            _log("warning", f"NISQA download attempt failed: {e}")
             continue
 
-    logger.warning("NISQA weights download failed, using neural fallback")
+    _log("warning", "NISQA weights download failed, using neural fallback")
     return None
 
 
@@ -205,7 +222,7 @@ def get_seld_model_path(model_name: str = "seld_baseline") -> Optional[Path]:
 
     url = SELD_URLS.get(model_name)
     if not url:
-        logger.info("SELD model not in registry, using neural architecture", model=model_name)
+        _log("info", "SELD model not in registry, using neural architecture", model=model_name)
         return None
 
     archive_path = cache_dir / f"{model_name}.zip"
@@ -248,7 +265,7 @@ def get_styletts2_model_path(model_name: str = "ljspeech") -> Optional[Path]:
 
     url = STYLETTS2_URLS.get(model_name)
     if not url:
-        logger.warning("Unknown StyleTTS2 model", model=model_name)
+        _log("warning", "Unknown StyleTTS2 model", model=model_name)
         return None
 
     if download_file(url, model_path):
