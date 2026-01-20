@@ -1,61 +1,83 @@
 """
 AION Process & Agent Manager System
 
-State-of-the-art OS process management layer for AION that enables:
-- Long-running AI agent management
-- Background task execution
-- Scheduled job processing
-- Inter-process communication
-- Resource limit enforcement
-- Process lifecycle supervision
+Enterprise-grade, state-of-the-art OS process management layer for AION that enables:
+- Long-running AI agent management with full lifecycle control
+- Background task execution with worker pools
+- Scheduled job processing (cron, interval, one-time, DAG workflows)
+- Inter-process communication via distributed event bus
+- Resource limit enforcement and fair-share scheduling
+- Process lifecycle supervision with restart policies
+- Distributed cluster support with leader election
+- Fault tolerance (circuit breaker, bulkhead, saga patterns)
+- Comprehensive observability (OpenTelemetry, Prometheus)
+- Security (capability-based access, sandboxing, audit logging)
+- Process pooling for pre-warmed agents
 
 Example usage:
     ```python
     from aion.systems.process import (
+        # Core components
         ProcessSupervisor,
         EventBus,
         TaskScheduler,
         WorkerPool,
+
+        # Configuration
         AgentConfig,
-        BaseAgent,
         ProcessPriority,
         RestartPolicy,
+
+        # Agents
+        BaseAgent,
+
+        # Distributed
+        ClusterCoordinator,
+        DistributedEventBus,
+
+        # DAG Workflows
+        DAGScheduler,
+        DAGDefinition,
+        DAGTask,
+
+        # Resilience
+        CircuitBreaker,
+        Bulkhead,
+        SagaOrchestrator,
+
+        # Observability
+        Tracer,
+        MetricsRegistry,
+        AIONMetrics,
+
+        # Security
+        SecurityManager,
+        Capability,
+        CapabilityManager,
+
+        # Pooling
+        ProcessPool,
+        PoolConfig,
     )
 
     # Initialize core components
-    event_bus = EventBus()
-    await event_bus.initialize()
+    async with EventBus() as event_bus:
+        async with ProcessSupervisor(event_bus) as supervisor:
+            # Define a custom agent
+            class MyAgent(BaseAgent):
+                async def run(self):
+                    while not self._shutdown_requested:
+                        await self._paused.wait()
+                        await self.sleep(1)
 
-    supervisor = ProcessSupervisor(event_bus)
-    await supervisor.initialize()
-
-    scheduler = TaskScheduler(supervisor, event_bus)
-    await scheduler.initialize()
-
-    # Define a custom agent
-    class MyAgent(BaseAgent):
-        async def run(self):
-            while not self._shutdown_requested:
-                await self._paused.wait()
-                # Agent work here
-                await self.sleep(1)
-
-    # Register and spawn
-    supervisor.register_agent_class("my_agent", MyAgent)
-
-    agent_id = await supervisor.spawn_agent(AgentConfig(
-        name="my_agent_1",
-        agent_class="my_agent",
-        priority=ProcessPriority.NORMAL,
-        restart_policy=RestartPolicy.ON_FAILURE,
-    ))
-
-    # Schedule tasks
-    await scheduler.schedule_cron(
-        name="daily_cleanup",
-        handler="cleanup_handler",
-        cron_expression="0 3 * * *",
-    )
+            # Register and spawn
+            supervisor.register_agent_class("my_agent", MyAgent)
+            agent_id = await supervisor.spawn_agent(AgentConfig(
+                name="my_agent_1",
+                agent_class="my_agent",
+                priority=ProcessPriority.NORMAL,
+                restart_policy=RestartPolicy.ON_FAILURE,
+            ))
     ```
 """
 
@@ -142,7 +164,142 @@ from aion.systems.process.resources import (
     ResourceThrottler,
 )
 
+# === NEW SOTA FEATURES ===
+
+# Cluster / Distributed support
+from aion.systems.process.cluster import (
+    ClusterCoordinator,
+    NodeInfo,
+    NodeState,
+    LeaderState,
+    ClusterMessage,
+    ProcessMigration,
+    ConsistentHashRing,
+    ClusterTransport,
+    UDPClusterTransport,
+    TCPClusterTransport,
+)
+
+# Distributed Event Bus
+from aion.systems.process.distributed_bus import (
+    DistributedEventBus,
+    DistributedMessage,
+    DistributedBusBackend,
+    InMemoryDistributedBackend,
+    RedisDistributedBackend,
+    ConsumerGroup,
+    TopicConfig,
+    DeliveryGuarantee,
+    PartitionStrategy,
+)
+
+# DAG-based Task Scheduler
+from aion.systems.process.dag_scheduler import (
+    DAGScheduler,
+    DAGDefinition,
+    DAGTask,
+    DAGRun,
+    TaskStatus as DAGTaskStatus,
+    TriggerRule,
+    FairShareGroup,
+    create_dag,
+    create_task,
+)
+
+# Observability (OpenTelemetry + Prometheus)
+from aion.systems.process.observability import (
+    # Tracing
+    Tracer,
+    Span,
+    SpanContext,
+    SpanKind,
+    SpanStatus,
+    SpanExporter,
+    ConsoleSpanExporter,
+    OTLPSpanExporter,
+    # Metrics
+    MetricsRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    Summary,
+    AIONMetrics,
+    # Globals
+    get_tracer,
+    get_metrics,
+    set_tracer,
+    set_metrics,
+)
+
+# Resilience patterns
+from aion.systems.process.resilience import (
+    # Circuit Breaker
+    CircuitBreaker,
+    CircuitState,
+    CircuitBreakerConfig,
+    CircuitBreakerMetrics,
+    CircuitOpenError,
+    # Bulkhead
+    Bulkhead,
+    BulkheadConfig,
+    BulkheadFullError,
+    # Retry
+    Retry,
+    RetryConfig,
+    BackoffStrategy,
+    # Timeout
+    Timeout,
+    # Saga
+    SagaOrchestrator,
+    SagaDefinition,
+    SagaStep,
+    SagaStepStatus,
+    SagaFailedError,
+    # Combined
+    resilient,
+    ResilienceManager,
+    get_resilience_manager,
+)
+
+# Security
+from aion.systems.process.security import (
+    # Capabilities
+    Capability,
+    CapabilityToken,
+    CapabilityManager,
+    require_capability,
+    # Sandboxing
+    Sandbox,
+    SandboxConfig,
+    SandboxManager,
+    # Audit logging
+    AuditLogger,
+    AuditEvent,
+    AuditEventType,
+    AuditSink,
+    ConsoleAuditSink,
+    FileAuditSink,
+    # Security Manager
+    SecurityManager,
+    get_security_manager,
+    initialize_security,
+)
+
+# Process Pooling
+from aion.systems.process.pool import (
+    ProcessPool,
+    PoolConfig,
+    PoolStats,
+    PooledProcess,
+    PooledProcessState,
+    ProcessPoolManager,
+    PoolExhaustedError,
+    OptimizedCronParser,
+    get_pool_manager,
+)
+
 __all__ = [
+    # === Core ===
     # State enums
     "ProcessState",
     "ProcessPriority",
@@ -195,6 +352,113 @@ __all__ = [
     "SQLiteProcessStore",
     "InMemoryProcessStore",
     "create_store",
+
+    # === SOTA Features ===
+
+    # Cluster / Distributed
+    "ClusterCoordinator",
+    "NodeInfo",
+    "NodeState",
+    "LeaderState",
+    "ClusterMessage",
+    "ProcessMigration",
+    "ConsistentHashRing",
+    "ClusterTransport",
+    "UDPClusterTransport",
+    "TCPClusterTransport",
+
+    # Distributed Event Bus
+    "DistributedEventBus",
+    "DistributedMessage",
+    "DistributedBusBackend",
+    "InMemoryDistributedBackend",
+    "RedisDistributedBackend",
+    "ConsumerGroup",
+    "TopicConfig",
+    "DeliveryGuarantee",
+    "PartitionStrategy",
+
+    # DAG Scheduler
+    "DAGScheduler",
+    "DAGDefinition",
+    "DAGTask",
+    "DAGRun",
+    "DAGTaskStatus",
+    "TriggerRule",
+    "FairShareGroup",
+    "create_dag",
+    "create_task",
+
+    # Observability
+    "Tracer",
+    "Span",
+    "SpanContext",
+    "SpanKind",
+    "SpanStatus",
+    "SpanExporter",
+    "ConsoleSpanExporter",
+    "OTLPSpanExporter",
+    "MetricsRegistry",
+    "Counter",
+    "Gauge",
+    "Histogram",
+    "Summary",
+    "AIONMetrics",
+    "get_tracer",
+    "get_metrics",
+    "set_tracer",
+    "set_metrics",
+
+    # Resilience
+    "CircuitBreaker",
+    "CircuitState",
+    "CircuitBreakerConfig",
+    "CircuitBreakerMetrics",
+    "CircuitOpenError",
+    "Bulkhead",
+    "BulkheadConfig",
+    "BulkheadFullError",
+    "Retry",
+    "RetryConfig",
+    "BackoffStrategy",
+    "Timeout",
+    "SagaOrchestrator",
+    "SagaDefinition",
+    "SagaStep",
+    "SagaStepStatus",
+    "SagaFailedError",
+    "resilient",
+    "ResilienceManager",
+    "get_resilience_manager",
+
+    # Security
+    "Capability",
+    "CapabilityToken",
+    "CapabilityManager",
+    "require_capability",
+    "Sandbox",
+    "SandboxConfig",
+    "SandboxManager",
+    "AuditLogger",
+    "AuditEvent",
+    "AuditEventType",
+    "AuditSink",
+    "ConsoleAuditSink",
+    "FileAuditSink",
+    "SecurityManager",
+    "get_security_manager",
+    "initialize_security",
+
+    # Process Pooling
+    "ProcessPool",
+    "PoolConfig",
+    "PoolStats",
+    "PooledProcess",
+    "PooledProcessState",
+    "ProcessPoolManager",
+    "PoolExhaustedError",
+    "OptimizedCronParser",
+    "get_pool_manager",
 ]
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
