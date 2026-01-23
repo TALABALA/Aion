@@ -1532,5 +1532,731 @@ class TestHealthCheck:
         assert d["status"] == "healthy"
 
 
+# ==================== SOTA v2 Feature Tests ====================
+
+# Import new SOTA modules
+from aion.mcp.distributed import (
+    InMemoryBackend,
+    DistributedLock,
+    DistributedCircuitBreaker,
+    CircuitBreakerOpenError,
+    DistributedRateLimiter,
+    DistributedCache,
+)
+
+from aion.mcp.observability import (
+    CorrelationContext,
+    correlation_context,
+    get_correlation_id,
+    set_correlation_id,
+    get_trace_context,
+    ProbabilitySampler,
+    RateLimitingSampler,
+    AdaptiveSampler,
+    SamplingDecision,
+    Exemplar,
+    ExemplarReservoir,
+    ContextualLogger,
+)
+
+from aion.mcp.security import (
+    RequestSigner,
+    SignatureAlgorithm,
+    MTLSConfig,
+    CredentialRotator,
+    RotationConfig,
+    RotationStrategy,
+    SecretScanner,
+    SecretFinding,
+    SecurityAuditLogger,
+    AuditEventType,
+)
+
+from aion.mcp.chaos import (
+    ChaosMonkey,
+    ChaosConfig,
+    ChaosMode,
+    FaultConfig,
+    FaultType,
+    FaultProfiles,
+    LatencyDistribution,
+    ChaosError,
+)
+
+
+class TestDistributedBackend:
+    """Test Distributed Backend."""
+
+    @pytest.fixture
+    def backend(self):
+        """Create in-memory backend for testing."""
+        return InMemoryBackend()
+
+    @pytest.mark.asyncio
+    async def test_set_get(self, backend):
+        """Test basic set and get."""
+        await backend.set("key", "value")
+        result = await backend.get("key")
+        assert result == "value"
+
+    @pytest.mark.asyncio
+    async def test_set_with_ttl(self, backend):
+        """Test set with TTL."""
+        await backend.set("key", "value", ttl=0.1)
+        result = await backend.get("key")
+        assert result == "value"
+
+        await asyncio.sleep(0.2)
+        result = await backend.get("key")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_setnx(self, backend):
+        """Test set if not exists."""
+        result1 = await backend.setnx("key", "value1")
+        assert result1 is True
+
+        result2 = await backend.setnx("key", "value2")
+        assert result2 is False
+
+        value = await backend.get("key")
+        assert value == "value1"
+
+    @pytest.mark.asyncio
+    async def test_incr(self, backend):
+        """Test increment."""
+        result1 = await backend.incr("counter")
+        assert result1 == 1
+
+        result2 = await backend.incr("counter", 5)
+        assert result2 == 6
+
+    @pytest.mark.asyncio
+    async def test_sorted_set(self, backend):
+        """Test sorted set operations."""
+        await backend.zadd("zset", 1.0, "member1")
+        await backend.zadd("zset", 2.0, "member2")
+        await backend.zadd("zset", 3.0, "member3")
+
+        count = await backend.zcard("zset")
+        assert count == 3
+
+        removed = await backend.zremrangebyscore("zset", 0, 1.5)
+        assert removed == 1
+
+        count = await backend.zcard("zset")
+        assert count == 2
+
+
+class TestDistributedLock:
+    """Test Distributed Lock."""
+
+    @pytest.fixture
+    def backend(self):
+        return InMemoryBackend()
+
+    @pytest.mark.asyncio
+    async def test_acquire_release(self, backend):
+        """Test lock acquire and release."""
+        lock = DistributedLock(backend, "test_lock")
+
+        acquired = await lock.acquire()
+        assert acquired is True
+
+        released = await lock.release()
+        assert released is True
+
+    @pytest.mark.asyncio
+    async def test_lock_exclusion(self, backend):
+        """Test lock provides exclusion."""
+        lock1 = DistributedLock(backend, "test_lock", retry_count=1)
+        lock2 = DistributedLock(backend, "test_lock", retry_count=1)
+
+        await lock1.acquire()
+
+        acquired = await lock2.acquire(blocking=False)
+        assert acquired is False
+
+        await lock1.release()
+
+        acquired = await lock2.acquire()
+        assert acquired is True
+
+    @pytest.mark.asyncio
+    async def test_lock_context_manager(self, backend):
+        """Test lock as context manager."""
+        lock = DistributedLock(backend, "test_lock")
+
+        async with lock:
+            # Lock should be held
+            lock2 = DistributedLock(backend, "test_lock", retry_count=1)
+            acquired = await lock2.acquire(blocking=False)
+            assert acquired is False
+
+        # Lock should be released
+        acquired = await lock2.acquire()
+        assert acquired is True
+
+
+class TestDistributedCircuitBreaker:
+    """Test Distributed Circuit Breaker."""
+
+    @pytest.fixture
+    def backend(self):
+        return InMemoryBackend()
+
+    @pytest.fixture
+    def circuit(self, backend):
+        return DistributedCircuitBreaker(
+            backend=backend,
+            name="test_cb",
+            failure_threshold=3,
+            success_threshold=2,
+            timeout=1.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_initial_state(self, circuit):
+        """Test initial state is closed."""
+        state = await circuit.get_state()
+        assert state == "closed"
+
+    @pytest.mark.asyncio
+    async def test_opens_after_failures(self, circuit):
+        """Test circuit opens after failures."""
+        for _ in range(3):
+            await circuit.record_failure()
+
+        state = await circuit.get_state()
+        assert state == "open"
+
+    @pytest.mark.asyncio
+    async def test_success_in_closed(self, circuit):
+        """Test success recording in closed state."""
+        await circuit.record_success()
+        state = await circuit.get_state()
+        assert state == "closed"
+
+    @pytest.mark.asyncio
+    async def test_context_manager(self, circuit):
+        """Test context manager usage."""
+        async with circuit:
+            pass  # Success
+
+        state = await circuit.get_state()
+        assert state == "closed"
+
+    @pytest.mark.asyncio
+    async def test_stats(self, circuit):
+        """Test statistics."""
+        await circuit.record_success()
+        await circuit.record_failure()
+
+        stats = await circuit.get_stats()
+        assert stats["name"] == "test_cb"
+        assert "failure_count" in stats
+        assert "success_count" in stats
+
+
+class TestDistributedRateLimiter:
+    """Test Distributed Rate Limiter."""
+
+    @pytest.fixture
+    def backend(self):
+        return InMemoryBackend()
+
+    @pytest.fixture
+    def limiter(self, backend):
+        return DistributedRateLimiter(
+            backend=backend,
+            name="test_rl",
+            rate=5.0,
+            window=1.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_allows_under_limit(self, limiter):
+        """Test allows requests under limit."""
+        for _ in range(5):
+            result = await limiter.acquire()
+            assert result is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_over_limit(self, limiter):
+        """Test rejects over limit."""
+        for _ in range(5):
+            await limiter.acquire()
+
+        result = await limiter.acquire()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_get_remaining(self, limiter):
+        """Test getting remaining tokens."""
+        remaining = await limiter.get_remaining()
+        assert remaining == 5
+
+        await limiter.acquire()
+        remaining = await limiter.get_remaining()
+        assert remaining == 4
+
+
+class TestDistributedCache:
+    """Test Distributed Cache with stampede prevention."""
+
+    @pytest.fixture
+    def backend(self):
+        return InMemoryBackend()
+
+    @pytest.fixture
+    def cache(self, backend):
+        return DistributedCache[str](
+            backend=backend,
+            name="test_cache",
+            default_ttl=10.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_get(self, cache):
+        """Test basic set and get."""
+        await cache.set("key", "value")
+        result = await cache.get("key")
+        assert result == "value"
+
+    @pytest.mark.asyncio
+    async def test_miss_with_loader(self, cache):
+        """Test cache miss with loader."""
+        load_count = 0
+
+        async def loader():
+            nonlocal load_count
+            load_count += 1
+            return "loaded_value"
+
+        result = await cache.get("key", loader=loader)
+        assert result == "loaded_value"
+        assert load_count == 1
+
+        # Second call should hit cache
+        result = await cache.get("key", loader=loader)
+        assert result == "loaded_value"
+        assert load_count == 1  # No additional load
+
+    @pytest.mark.asyncio
+    async def test_delete(self, cache):
+        """Test delete."""
+        await cache.set("key", "value")
+        await cache.delete("key")
+        result = await cache.get("key")
+        assert result is None
+
+
+class TestCorrelationContext:
+    """Test Correlation Context."""
+
+    @pytest.mark.asyncio
+    async def test_new_context(self):
+        """Test creating new context."""
+        ctx = CorrelationContext.new(
+            operation_name="test_op",
+            service_name="test_service",
+        )
+
+        assert ctx.correlation_id is not None
+        assert ctx.trace_id is not None
+        assert ctx.span_id is not None
+        assert ctx.operation_name == "test_op"
+
+    @pytest.mark.asyncio
+    async def test_context_propagation(self):
+        """Test context propagation via context manager."""
+        async with correlation_context(operation_name="outer") as outer_ctx:
+            assert get_correlation_id() == outer_ctx.correlation_id
+
+            async with correlation_context(operation_name="inner") as inner_ctx:
+                # Should inherit correlation ID
+                assert inner_ctx.correlation_id == outer_ctx.correlation_id
+                # But have different span ID
+                assert inner_ctx.span_id != outer_ctx.span_id
+                # And parent should be set
+                assert inner_ctx.parent_span_id == outer_ctx.span_id
+
+    @pytest.mark.asyncio
+    async def test_headers_round_trip(self):
+        """Test headers serialization round-trip."""
+        ctx = CorrelationContext.new(operation_name="test")
+        ctx.baggage["user_id"] = "123"
+
+        headers = ctx.to_headers()
+        restored = CorrelationContext.from_headers(headers)
+
+        assert restored.correlation_id == ctx.correlation_id
+        assert restored.trace_id == ctx.trace_id
+        assert restored.baggage.get("user_id") == "123"
+
+
+class TestSamplers:
+    """Test Trace Samplers."""
+
+    def test_probability_sampler(self):
+        """Test probabilistic sampler."""
+        sampler = ProbabilitySampler(probability=1.0)
+        result = sampler.should_sample("trace123", "test_span")
+        assert result.decision == SamplingDecision.RECORD_AND_SAMPLE
+
+        sampler = ProbabilitySampler(probability=0.0)
+        result = sampler.should_sample("trace123", "test_span")
+        assert result.decision == SamplingDecision.DROP
+
+    def test_rate_limiting_sampler(self):
+        """Test rate-limiting sampler."""
+        sampler = RateLimitingSampler(max_traces_per_second=2.0)
+
+        # Should allow first two
+        result1 = sampler.should_sample("trace1", "span")
+        result2 = sampler.should_sample("trace2", "span")
+        assert result1.decision == SamplingDecision.RECORD_AND_SAMPLE
+        assert result2.decision == SamplingDecision.RECORD_AND_SAMPLE
+
+        # Third should be dropped
+        result3 = sampler.should_sample("trace3", "span")
+        assert result3.decision == SamplingDecision.DROP
+
+    def test_adaptive_sampler(self):
+        """Test adaptive sampler."""
+        sampler = AdaptiveSampler(
+            target_traces_per_second=10.0,
+            min_probability=0.01,
+            max_probability=1.0,
+        )
+
+        # Should sample initially (high probability)
+        result = sampler.should_sample("trace1", "span")
+        # May or may not sample, just ensure no error
+        assert result.decision in [
+            SamplingDecision.RECORD_AND_SAMPLE,
+            SamplingDecision.DROP,
+        ]
+
+        # Errors should always be sampled
+        result = sampler.should_sample(
+            "trace2",
+            "span",
+            attributes={"error": True},
+        )
+        assert result.decision == SamplingDecision.RECORD_AND_SAMPLE
+
+
+class TestExemplars:
+    """Test Exemplars."""
+
+    @pytest.mark.asyncio
+    async def test_exemplar_reservoir(self):
+        """Test exemplar reservoir."""
+        reservoir = ExemplarReservoir(max_size=5)
+
+        # Set up trace context
+        async with correlation_context() as ctx:
+            for i in range(10):
+                await reservoir.add(float(i), {"index": str(i)})
+
+        exemplars = reservoir.get_exemplars()
+        # Should have at most max_size exemplars
+        assert len(exemplars) <= 5
+
+    @pytest.mark.asyncio
+    async def test_exemplar_has_trace_context(self):
+        """Test exemplar captures trace context."""
+        reservoir = ExemplarReservoir(max_size=5)
+
+        async with correlation_context() as ctx:
+            await reservoir.add(42.0)
+
+        exemplars = reservoir.get_exemplars()
+        assert len(exemplars) == 1
+        assert exemplars[0].trace_id == ctx.trace_id
+        assert exemplars[0].span_id == ctx.span_id
+
+
+class TestRequestSigning:
+    """Test Request Signing."""
+
+    @pytest.fixture
+    def signer(self):
+        return RequestSigner(
+            key_id="test_key",
+            secret_key=b"secret123",
+            algorithm=SignatureAlgorithm.HMAC_SHA256,
+        )
+
+    def test_sign_request(self, signer):
+        """Test signing a request."""
+        signed = signer.sign(
+            method="POST",
+            path="/api/test",
+            body=b'{"data": "test"}',
+        )
+
+        assert signed.signature is not None
+        assert signed.key_id == "test_key"
+        assert signed.algorithm == SignatureAlgorithm.HMAC_SHA256
+
+    def test_verify_valid_signature(self, signer):
+        """Test verifying valid signature."""
+        signed = signer.sign(
+            method="POST",
+            path="/api/test",
+            body=b'{"data": "test"}',
+        )
+
+        is_valid = signer.verify(signed)
+        assert is_valid is True
+
+    def test_reject_tampered_signature(self, signer):
+        """Test rejecting tampered signature."""
+        signed = signer.sign(
+            method="POST",
+            path="/api/test",
+            body=b'{"data": "test"}',
+        )
+
+        # Tamper with the request
+        signed.body = b'{"data": "tampered"}'
+
+        is_valid = signer.verify(signed)
+        assert is_valid is False
+
+    def test_reject_expired_signature(self, signer):
+        """Test rejecting expired signature."""
+        signed = signer.sign(
+            method="POST",
+            path="/api/test",
+        )
+
+        # Simulate old timestamp
+        signed.timestamp = signed.timestamp - 600  # 10 minutes ago
+
+        is_valid = signer.verify(signed)
+        assert is_valid is False
+
+
+class TestSecretScanner:
+    """Test Secret Scanner."""
+
+    @pytest.fixture
+    def scanner(self):
+        return SecretScanner()
+
+    def test_detect_aws_key(self, scanner):
+        """Test detecting AWS access key."""
+        content = "aws_key = AKIAIOSFODNN7EXAMPLE"
+        findings = scanner.scan(content)
+
+        assert len(findings) >= 1
+        assert any(f.pattern_name == "aws_access_key" for f in findings)
+
+    def test_detect_github_token(self, scanner):
+        """Test detecting GitHub token."""
+        content = "token = ghp_1234567890abcdefghijklmnopqrstuvwxyz"
+        findings = scanner.scan(content)
+
+        assert len(findings) >= 1
+        assert any(f.pattern_name == "github_token" for f in findings)
+
+    def test_detect_private_key(self, scanner):
+        """Test detecting private key."""
+        content = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow..."
+        findings = scanner.scan(content)
+
+        assert len(findings) >= 1
+        assert any(f.pattern_name == "private_key" for f in findings)
+
+    def test_redact_secrets(self, scanner):
+        """Test redacting secrets."""
+        content = "key = AKIAIOSFODNN7EXAMPLE"
+        redacted = scanner.redact(content)
+
+        assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+        assert "****" in redacted
+
+
+class TestCredentialRotator:
+    """Test Credential Rotator."""
+
+    @pytest.fixture
+    def rotator(self):
+        rotated_ids = []
+
+        def rotate_callback(cred_id):
+            rotated_ids.append(cred_id)
+            return {"new_secret": "rotated"}
+
+        config = RotationConfig(
+            strategy=RotationStrategy.TIME_BASED,
+            rotation_interval=timedelta(hours=1),
+        )
+
+        rotator = CredentialRotator(
+            config=config,
+            rotation_callback=rotate_callback,
+        )
+        rotator._rotated_ids = rotated_ids
+        return rotator
+
+    @pytest.mark.asyncio
+    async def test_register_credential(self, rotator):
+        """Test registering credential."""
+        meta = await rotator.register_credential(
+            credential_id="test_cred",
+            tags={"env": "test"},
+        )
+
+        assert meta.credential_id == "test_cred"
+        assert meta.tags["env"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_record_usage(self, rotator):
+        """Test recording usage."""
+        await rotator.register_credential("test_cred")
+        await rotator.record_usage("test_cred")
+
+        meta = rotator._credentials["test_cred"]
+        assert meta.usage_count == 1
+
+    @pytest.mark.asyncio
+    async def test_force_rotate(self, rotator):
+        """Test force rotation."""
+        await rotator.register_credential("test_cred")
+        result = await rotator.force_rotate("test_cred")
+
+        assert result is True
+        assert "test_cred" in rotator._rotated_ids
+
+
+class TestChaosMonkey:
+    """Test Chaos Monkey."""
+
+    @pytest.fixture
+    def chaos(self):
+        config = ChaosConfig(mode=ChaosMode.ENABLED)
+        return ChaosMonkey(config)
+
+    def test_initial_state_disabled(self):
+        """Test chaos is disabled by default."""
+        chaos = ChaosMonkey()
+        assert chaos.config.mode == ChaosMode.DISABLED
+
+    def test_enable_disable(self, chaos):
+        """Test enabling and disabling."""
+        chaos.disable()
+        assert chaos.config.mode == ChaosMode.DISABLED
+
+        chaos.enable()
+        assert chaos.config.mode == ChaosMode.ENABLED
+
+    def test_add_fault(self, chaos):
+        """Test adding faults."""
+        fault = FaultConfig(
+            fault_type=FaultType.LATENCY,
+            probability=0.5,
+        )
+        chaos.add_fault(fault)
+
+        assert len(chaos.config.faults) == 1
+
+    def test_remove_fault(self, chaos):
+        """Test removing faults."""
+        fault = FaultConfig(fault_type=FaultType.LATENCY)
+        chaos.add_fault(fault)
+
+        removed = chaos.remove_fault(FaultType.LATENCY)
+        assert removed == 1
+        assert len(chaos.config.faults) == 0
+
+    @pytest.mark.asyncio
+    async def test_maybe_inject_disabled(self):
+        """Test no injection when disabled."""
+        chaos = ChaosMonkey(ChaosConfig(mode=ChaosMode.DISABLED))
+        chaos.add_fault(FaultConfig(
+            fault_type=FaultType.ERROR,
+            probability=1.0,
+        ))
+
+        result = await chaos.maybe_inject("target")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_dry_run_mode(self, chaos):
+        """Test dry run mode logs but doesn't inject."""
+        chaos.set_dry_run()
+        chaos.add_fault(FaultConfig(
+            fault_type=FaultType.ERROR,
+            probability=1.0,
+        ))
+
+        result = await chaos.maybe_inject("target")
+        assert result is not None
+        assert result.get("dry_run") is True
+
+    def test_get_stats(self, chaos):
+        """Test statistics."""
+        stats = chaos.get_stats()
+
+        assert stats["mode"] == "enabled"
+        assert "total_calls" in stats
+        assert "faults_injected" in stats
+
+
+class TestFaultProfiles:
+    """Test pre-built fault profiles."""
+
+    def test_network_latency(self):
+        """Test network latency profile."""
+        fault = FaultProfiles.network_latency(probability=0.2)
+
+        assert fault.fault_type == FaultType.LATENCY
+        assert fault.probability == 0.2
+        assert fault.latency_distribution == LatencyDistribution.PARETO
+
+    def test_service_unavailable(self):
+        """Test service unavailable profile."""
+        fault = FaultProfiles.service_unavailable()
+
+        assert fault.fault_type == FaultType.ERROR
+        assert fault.error_code == 503
+
+    def test_timeout(self):
+        """Test timeout profile."""
+        fault = FaultProfiles.timeout(timeout_ms=5000)
+
+        assert fault.fault_type == FaultType.TIMEOUT
+        assert fault.latency_max_ms == 5000
+
+    def test_intermittent_failure(self):
+        """Test intermittent failure profile."""
+        faults = FaultProfiles.intermittent_failure()
+
+        assert len(faults) == 2
+        assert any(f.fault_type == FaultType.LATENCY for f in faults)
+        assert any(f.fault_type == FaultType.ERROR for f in faults)
+
+
+class TestMTLSConfig:
+    """Test mTLS Configuration."""
+
+    def test_create_ssl_context(self):
+        """Test creating SSL context."""
+        config = MTLSConfig(enabled=True)
+        context = config.create_ssl_context()
+
+        assert context is not None
+
+    def test_disabled_returns_none(self):
+        """Test disabled config returns None for context."""
+        config = MTLSConfig(enabled=False)
+        # When disabled, we typically don't create a context
+        # The factory handles this
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

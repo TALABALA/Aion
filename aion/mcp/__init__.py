@@ -195,6 +195,83 @@ from aion.mcp.streaming import (
 # Manager configuration
 from aion.mcp.manager import MCPManagerConfig
 
+# Distributed primitives (Redis-backed)
+from aion.mcp.distributed import (
+    DistributedBackend,
+    RedisBackend,
+    InMemoryBackend,
+    DistributedLock,
+    DistributedCircuitBreaker,
+    CircuitBreakerOpenError,
+    DistributedRateLimiter,
+    DistributedCache,
+    init_distributed_backend,
+    get_distributed_backend,
+    close_distributed_backend,
+)
+
+# Advanced observability (correlation, sampling, exemplars)
+from aion.mcp.observability import (
+    CorrelationContext,
+    correlation_context,
+    get_correlation_id,
+    set_correlation_id,
+    get_trace_context,
+    get_baggage,
+    set_baggage_item,
+    Sampler,
+    AlwaysOnSampler,
+    AlwaysOffSampler,
+    ProbabilitySampler,
+    RateLimitingSampler,
+    AdaptiveSampler,
+    ParentBasedSampler,
+    SamplingDecision,
+    Exemplar,
+    ExemplarReservoir,
+    MetricWithExemplars,
+    ContextualLogger,
+    with_correlation,
+    get_sampler,
+    set_sampler,
+)
+
+# Security (signing, mTLS, rotation, scanning)
+from aion.mcp.security import (
+    RequestSigner,
+    SignedRequest,
+    SignatureAlgorithm,
+    MTLSConfig,
+    MTLSClientFactory,
+    CredentialRotator,
+    RotationConfig,
+    RotationStrategy,
+    SecretScanner,
+    SecretPattern,
+    SecretFinding,
+    SecurityAuditLogger,
+    AuditEvent,
+    AuditEventType,
+    get_audit_logger,
+    get_secret_scanner,
+)
+
+# Chaos engineering
+from aion.mcp.chaos import (
+    ChaosMonkey,
+    ChaosConfig,
+    ChaosMode,
+    FaultConfig,
+    FaultType,
+    FaultProfiles,
+    LatencyDistribution,
+    ChaosError,
+    ChaosExperiment,
+    ExperimentResult,
+    get_chaos_monkey,
+    init_chaos_monkey,
+)
+
 __all__ = [
     # Version
     "MCP_PROTOCOL_VERSION",
@@ -364,4 +441,73 @@ __all__ = [
 
     # Manager Configuration
     "MCPManagerConfig",
+
+    # Distributed Primitives
+    "DistributedBackend",
+    "RedisBackend",
+    "InMemoryBackend",
+    "DistributedLock",
+    "DistributedCircuitBreaker",
+    "CircuitBreakerOpenError",
+    "DistributedRateLimiter",
+    "DistributedCache",
+    "init_distributed_backend",
+    "get_distributed_backend",
+    "close_distributed_backend",
+
+    # Advanced Observability
+    "CorrelationContext",
+    "correlation_context",
+    "get_correlation_id",
+    "set_correlation_id",
+    "get_trace_context",
+    "get_baggage",
+    "set_baggage_item",
+    "Sampler",
+    "AlwaysOnSampler",
+    "AlwaysOffSampler",
+    "ProbabilitySampler",
+    "RateLimitingSampler",
+    "AdaptiveSampler",
+    "ParentBasedSampler",
+    "SamplingDecision",
+    "Exemplar",
+    "ExemplarReservoir",
+    "MetricWithExemplars",
+    "ContextualLogger",
+    "with_correlation",
+    "get_sampler",
+    "set_sampler",
+
+    # Security
+    "RequestSigner",
+    "SignedRequest",
+    "SignatureAlgorithm",
+    "MTLSConfig",
+    "MTLSClientFactory",
+    "CredentialRotator",
+    "RotationConfig",
+    "RotationStrategy",
+    "SecretScanner",
+    "SecretPattern",
+    "SecretFinding",
+    "SecurityAuditLogger",
+    "AuditEvent",
+    "AuditEventType",
+    "get_audit_logger",
+    "get_secret_scanner",
+
+    # Chaos Engineering
+    "ChaosMonkey",
+    "ChaosConfig",
+    "ChaosMode",
+    "FaultConfig",
+    "FaultType",
+    "FaultProfiles",
+    "LatencyDistribution",
+    "ChaosError",
+    "ChaosExperiment",
+    "ExperimentResult",
+    "get_chaos_monkey",
+    "init_chaos_monkey",
 ]
