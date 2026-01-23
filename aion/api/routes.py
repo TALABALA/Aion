@@ -1616,3 +1616,250 @@ def setup_conversation_routes(app: FastAPI, kernel) -> None:
         }
 
     logger.info("Conversation routes initialized")
+
+
+# ==================== Goal System Routes ====================
+
+class GoalCreateRequest(BaseModel):
+    """Request to create a goal."""
+    title: str = Field(..., description="Goal title")
+    description: str = Field(..., description="Goal description")
+    success_criteria: list[str] = Field(default_factory=list, description="Success criteria")
+    priority: str = Field(default="medium", description="Priority level")
+    goal_type: str = Field(default="achievement", description="Type of goal")
+    deadline: Optional[datetime] = Field(default=None, description="Optional deadline")
+    tags: list[str] = Field(default_factory=list, description="Tags")
+    auto_decompose: bool = Field(default=False, description="Auto-decompose into subgoals")
+
+
+class GoalAbandonRequest(BaseModel):
+    """Request to abandon a goal."""
+    reason: str = Field(..., description="Reason for abandonment")
+
+
+class ApprovalActionRequest(BaseModel):
+    """Request to approve or deny a safety request."""
+    approver: str = Field(..., description="Approver identifier")
+    reason: str = Field(default="", description="Optional reason")
+
+
+class ObjectiveCreateRequest(BaseModel):
+    """Request to create an objective."""
+    name: str = Field(..., description="Objective name")
+    description: str = Field(..., description="Objective description")
+    rationale: str = Field(default="", description="Why this objective matters")
+
+
+def setup_goal_routes(app: FastAPI, kernel) -> None:
+    """Setup routes for the Autonomous Goal System."""
+
+    # Check if goal system is available
+    if not kernel.goals:
+        logger.warning("Goal system not initialized, skipping routes")
+        return
+
+    goal_manager = kernel.goals
+
+    # === Goal CRUD ===
+
+    @app.get("/goals")
+    async def list_goals(
+        status: Optional[str] = Query(default=None, description="Filter by status"),
+        priority: Optional[str] = Query(default=None, description="Filter by priority"),
+        goal_type: Optional[str] = Query(default=None, description="Filter by type"),
+        tag: Optional[str] = Query(default=None, description="Filter by tag"),
+        limit: int = Query(default=50, ge=1, le=200),
+    ):
+        """List goals with optional filtering."""
+        from aion.systems.goals.types import GoalStatus, GoalPriority, GoalType
+
+        goals = await goal_manager.registry.get_all()
+
+        if status:
+            try:
+                status_enum = GoalStatus(status)
+                goals = [g for g in goals if g.status == status_enum]
+            except ValueError:
+                pass
+
+        if priority:
+            try:
+                priority_enum = GoalPriority[priority.upper()]
+                goals = [g for g in goals if g.priority == priority_enum]
+            except (KeyError, ValueError):
+                pass
+
+        if goal_type:
+            try:
+                type_enum = GoalType(goal_type)
+                goals = [g for g in goals if g.goal_type == type_enum]
+            except ValueError:
+                pass
+
+        if tag:
+            goals = [g for g in goals if tag in g.tags]
+
+        return {"goals": [g.to_dict() for g in goals[:limit]]}
+
+    @app.post("/goals")
+    async def create_goal(request: GoalCreateRequest):
+        """Create a new goal."""
+        try:
+            goal = await goal_manager.submit_goal(
+                title=request.title,
+                description=request.description,
+                success_criteria=request.success_criteria,
+                priority=request.priority,
+                goal_type=request.goal_type,
+                deadline=request.deadline,
+                tags=request.tags,
+                auto_decompose=request.auto_decompose,
+            )
+            return {"goal": goal.to_dict()}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/goals/{goal_id}")
+    async def get_goal(goal_id: str):
+        """Get goal details."""
+        goal = await goal_manager.get_goal(goal_id)
+        if not goal:
+            raise HTTPException(status_code=404, detail="Goal not found")
+        return {"goal": goal.to_dict()}
+
+    @app.get("/goals/{goal_id}/progress")
+    async def get_goal_progress(goal_id: str):
+        """Get detailed goal progress."""
+        progress = await goal_manager.get_progress(goal_id)
+        if not progress:
+            raise HTTPException(status_code=404, detail="Goal not found")
+        return progress
+
+    @app.get("/goals/{goal_id}/health")
+    async def get_goal_health(goal_id: str):
+        """Get goal health status."""
+        health = await goal_manager.get_health(goal_id)
+        if "error" in health:
+            raise HTTPException(status_code=404, detail=health["error"])
+        return health
+
+    @app.post("/goals/{goal_id}/decompose")
+    async def decompose_goal(goal_id: str):
+        """Decompose a goal into subgoals."""
+        try:
+            subgoals = await goal_manager.decompose_goal(goal_id)
+            return {"subgoals": [g.to_dict() for g in subgoals]}
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/goals/{goal_id}/pause")
+    async def pause_goal(goal_id: str):
+        """Pause a goal."""
+        success = await goal_manager.pause_goal(goal_id)
+        return {"success": success}
+
+    @app.post("/goals/{goal_id}/resume")
+    async def resume_goal(goal_id: str):
+        """Resume a paused goal."""
+        success = await goal_manager.resume_goal(goal_id)
+        return {"success": success}
+
+    @app.post("/goals/{goal_id}/abandon")
+    async def abandon_goal(goal_id: str, request: GoalAbandonRequest):
+        """Abandon a goal."""
+        success = await goal_manager.abandon_goal(goal_id, request.reason)
+        return {"success": success}
+
+    # === Goal Generation ===
+
+    @app.post("/goals/generate")
+    async def generate_goals(max_goals: int = Query(default=2, ge=1, le=5)):
+        """Manually trigger goal generation."""
+        goals = await goal_manager.generate_goals(max_goals=max_goals)
+        return {"generated": [g.to_dict() for g in goals]}
+
+    @app.post("/goals/prioritize")
+    async def prioritize_goals():
+        """Reprioritize all pending goals."""
+        prioritized = await goal_manager.prioritize_goals()
+        return {"prioritized": [g.to_dict() for g in prioritized]}
+
+    # === Objectives ===
+
+    @app.get("/goals/objectives")
+    async def list_objectives():
+        """List all objectives."""
+        objectives = await goal_manager.get_objectives()
+        return {"objectives": [o.to_dict() for o in objectives]}
+
+    @app.post("/goals/objectives")
+    async def create_objective(request: ObjectiveCreateRequest):
+        """Create a new objective."""
+        objective = await goal_manager.create_objective(
+            name=request.name,
+            description=request.description,
+            rationale=request.rationale,
+        )
+        return {"objective": objective.to_dict()}
+
+    # === Safety ===
+
+    @app.get("/goals/safety/approvals")
+    async def get_pending_approvals():
+        """Get pending safety approval requests."""
+        approvals = goal_manager.get_pending_approvals()
+        return {"approvals": [a.to_dict() for a in approvals]}
+
+    @app.post("/goals/safety/approve/{request_id}")
+    async def approve_request(request_id: str, request: ApprovalActionRequest):
+        """Approve a safety request."""
+        success = await goal_manager.approve_action(request_id, request.approver)
+        return {"success": success}
+
+    @app.post("/goals/safety/deny/{request_id}")
+    async def deny_request(request_id: str, request: ApprovalActionRequest):
+        """Deny a safety request."""
+        success = await goal_manager.deny_action(request_id, request.approver, request.reason)
+        return {"success": success}
+
+    @app.post("/goals/safety/emergency-stop")
+    async def emergency_stop(reason: str = Body(default="Manual emergency stop", embed=True)):
+        """Activate emergency stop for the goal system."""
+        goal_manager.emergency_stop(reason)
+        return {"status": "emergency_stop_activated", "reason": reason}
+
+    @app.post("/goals/safety/clear-emergency-stop")
+    async def clear_emergency_stop():
+        """Clear emergency stop."""
+        goal_manager.clear_emergency_stop()
+        return {"status": "emergency_stop_cleared"}
+
+    # === Statistics ===
+
+    @app.get("/goals/stats")
+    async def get_goal_stats():
+        """Get comprehensive goal system statistics."""
+        return goal_manager.get_stats()
+
+    @app.get("/goals/health")
+    async def get_system_health():
+        """Get overall goal system health."""
+        return await goal_manager.get_system_health()
+
+    # === Events ===
+
+    @app.get("/goals/events")
+    async def get_goal_events(
+        goal_id: Optional[str] = Query(default=None),
+        event_type: Optional[str] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+    ):
+        """Get goal events."""
+        events = await goal_manager.registry.get_events(
+            goal_id=goal_id,
+            event_type=event_type,
+            limit=limit,
+        )
+        return {"events": [e.to_dict() for e in events]}
+
+    logger.info("Goal routes initialized")
