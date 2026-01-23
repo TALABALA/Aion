@@ -49,6 +49,13 @@ try:
 except ImportError:
     MCP_AVAILABLE = False
 
+# Goal system imports (conditional to avoid import errors)
+try:
+    from aion.systems.goals import AutonomousGoalManager
+    GOAL_SYSTEM_AVAILABLE = True
+except ImportError:
+    GOAL_SYSTEM_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -133,6 +140,9 @@ class AIONKernel:
 
         # Conversation system
         self._conversation = None
+
+        # Goal system
+        self._goal_manager = None
 
         # State
         self._status = SystemStatus.INITIALIZING
@@ -295,6 +305,10 @@ class AIONKernel:
         # Initialize Conversation System
         await self._initialize_conversation()
 
+        # Initialize Goal System
+        if GOAL_SYSTEM_AVAILABLE:
+            await self._initialize_goal_system()
+
     async def _initialize_conversation(self) -> None:
         """Initialize the Conversation System."""
         try:
@@ -347,6 +361,38 @@ class AIONKernel:
         except Exception as e:
             logger.error(f"Conversation system initialization failed: {e}")
             self._update_health("conversation", SystemStatus.ERROR, str(e))
+
+    async def _initialize_goal_system(self) -> None:
+        """Initialize the Autonomous Goal System."""
+        try:
+            from aion.systems.goals import AutonomousGoalManager
+            from aion.systems.goals.executor import GoalExecutor
+
+            # Create executor with available subsystems
+            executor = GoalExecutor(
+                planning_engine=self._planning_graph,
+                process_supervisor=self._supervisor,
+                tool_orchestrator=self._tool_orchestrator,
+                llm_provider=self._conversation.llm if self._conversation else None,
+            )
+
+            # Create goal manager
+            self._goal_manager = AutonomousGoalManager(
+                executor=executor,
+                auto_generate_goals=self.config.evolution.enable_self_improvement,
+                data_dir=str(self.config.data_dir / "goals"),
+            )
+
+            await self._goal_manager.initialize()
+            self._update_health("goals", SystemStatus.READY)
+            logger.info("Goal system initialized successfully")
+
+        except ImportError as e:
+            logger.warning(f"Goal system not available: {e}")
+            self._update_health("goals", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"Goal system initialization failed: {e}")
+            self._update_health("goals", SystemStatus.ERROR, str(e))
 
     async def _initialize_mcp(self) -> None:
         """Initialize the MCP Integration Layer."""
@@ -614,6 +660,10 @@ class AIONKernel:
         # Shutdown conversation system
         if self._conversation:
             await self._conversation.shutdown()
+
+        # Shutdown goal system
+        if self._goal_manager:
+            await self._goal_manager.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -1080,4 +1130,21 @@ Output a JSON array of steps, each with:
         return {
             "available": True,
             **self._mcp_manager.get_stats(),
+        }
+
+    # ==================== Goal System Access ====================
+
+    @property
+    def goals(self):
+        """Get the autonomous goal manager."""
+        return self._goal_manager
+
+    def get_goal_stats(self) -> dict[str, Any]:
+        """Get goal system statistics."""
+        if not self._goal_manager:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._goal_manager.get_stats(),
         }
