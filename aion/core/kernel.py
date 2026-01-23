@@ -131,6 +131,9 @@ class AIONKernel:
         self._mcp_manager = None
         self._mcp_server = None
 
+        # Conversation system
+        self._conversation = None
+
         # State
         self._status = SystemStatus.INITIALIZING
         self._health: dict[str, SystemHealth] = {}
@@ -288,6 +291,62 @@ class AIONKernel:
         # Initialize MCP Integration
         if MCP_AVAILABLE and self.config.mcp.enabled:
             await self._initialize_mcp()
+
+        # Initialize Conversation System
+        await self._initialize_conversation()
+
+    async def _initialize_conversation(self) -> None:
+        """Initialize the Conversation System."""
+        try:
+            from aion.conversation import (
+                ConversationManager,
+                ConversationConfig,
+            )
+            from aion.conversation.memory.integrator import MemoryIntegrator
+            from aion.conversation.tools.executor import ToolExecutor
+            from aion.conversation.llm.claude import ClaudeProvider
+
+            # Create memory integrator if memory system is available
+            memory_integrator = None
+            if self._memory_system:
+                memory_integrator = MemoryIntegrator(self._memory_system)
+
+            # Create tool executor if tool orchestrator is available
+            tool_executor = None
+            if self._tool_orchestrator:
+                tool_executor = ToolExecutor(self._tool_orchestrator)
+
+            # Create LLM provider
+            llm_provider = ClaudeProvider(
+                api_key=self.config.get_llm_api_key(),
+                default_model=self.config.llm.model,
+            )
+
+            # Create default conversation config
+            default_config = ConversationConfig(
+                model=self.config.llm.model,
+                max_tokens=self.config.llm.max_tokens,
+                temperature=self.config.llm.temperature,
+            )
+
+            # Create conversation manager
+            self._conversation = ConversationManager(
+                llm_provider=llm_provider,
+                memory_integrator=memory_integrator,
+                tool_executor=tool_executor,
+                default_config=default_config,
+            )
+
+            await self._conversation.initialize()
+            self._update_health("conversation", SystemStatus.READY)
+            logger.info("Conversation system initialized successfully")
+
+        except ImportError as e:
+            logger.warning(f"Conversation system not available: {e}")
+            self._update_health("conversation", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"Conversation system initialization failed: {e}")
+            self._update_health("conversation", SystemStatus.ERROR, str(e))
 
     async def _initialize_mcp(self) -> None:
         """Initialize the MCP Integration Layer."""
@@ -551,6 +610,10 @@ class AIONKernel:
         # Shutdown MCP integration
         if self._mcp_manager:
             await self._mcp_manager.shutdown()
+
+        # Shutdown conversation system
+        if self._conversation:
+            await self._conversation.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -981,6 +1044,21 @@ Output a JSON array of steps, each with:
     def audio(self):
         """Get the auditory cortex."""
         return self._audio_cortex
+
+    @property
+    def conversation(self):
+        """Get the conversation manager."""
+        return self._conversation
+
+    def get_conversation_stats(self) -> dict[str, Any]:
+        """Get conversation system statistics."""
+        if not self._conversation:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._conversation.get_stats(),
+        }
 
     # ==================== MCP Integration Access ====================
 

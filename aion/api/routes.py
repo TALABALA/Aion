@@ -1562,3 +1562,57 @@ def setup_mcp_routes(app: FastAPI, mcp_manager) -> None:
     async def mcp_stats():
         """Get MCP manager statistics."""
         return mcp_manager.get_stats()
+
+
+# ==================== Conversation Routes ====================
+
+def setup_conversation_routes(app: FastAPI, kernel) -> None:
+    """
+    Setup routes for the Conversation Interface.
+
+    The conversation system provides natural language interaction with all AION
+    capabilities including memory, tools, planning, and vision.
+    """
+    try:
+        from aion.conversation.transports.rest import (
+            create_conversation_router,
+            create_health_router,
+        )
+        from aion.conversation.transports.websocket import create_websocket_router
+
+        conversation_available = True
+    except ImportError:
+        conversation_available = False
+        logger.warning("Conversation module not available")
+        return
+
+    if not kernel.conversation:
+        logger.warning("Conversation manager not initialized, skipping routes")
+        return
+
+    # Create and include REST API router
+    conversation_router = create_conversation_router(kernel.conversation)
+    app.include_router(conversation_router, prefix="/api/v1")
+
+    # Create and include WebSocket router
+    ws_router = create_websocket_router(kernel.conversation)
+    app.include_router(ws_router, prefix="/api/v1")
+
+    # Add conversation stats to main stats endpoint
+    @app.get("/conversation/stats")
+    async def conversation_stats():
+        """Get conversation system statistics."""
+        return kernel.get_conversation_stats()
+
+    @app.get("/conversation/health")
+    async def conversation_health():
+        """Get conversation system health."""
+        if not kernel.conversation:
+            return {"status": "unavailable"}
+
+        return {
+            "status": "ready" if kernel.conversation.is_initialized else "initializing",
+            "active_sessions": kernel.conversation.sessions.active_count(),
+        }
+
+    logger.info("Conversation routes initialized")
