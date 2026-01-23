@@ -41,6 +41,14 @@ try:
 except ImportError:
     PROCESS_MANAGER_AVAILABLE = False
 
+# MCP integration imports (conditional to avoid import errors)
+try:
+    from aion.mcp import MCPManager, ServerRegistry, CredentialManager, MCPServer
+    from aion.mcp.server.aion_tools import setup_aion_mcp_server
+    MCP_AVAILABLE = True
+except ImportError:
+    MCP_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -118,6 +126,10 @@ class AIONKernel:
         self._scheduler = None
         self._worker_pool = None
         self._resource_manager = None
+
+        # MCP Integration components
+        self._mcp_manager = None
+        self._mcp_server = None
 
         # State
         self._status = SystemStatus.INITIALIZING
@@ -272,6 +284,54 @@ class AIONKernel:
         # Initialize Process Manager (core OS layer)
         if PROCESS_MANAGER_AVAILABLE:
             await self._initialize_process_manager()
+
+        # Initialize MCP Integration
+        if MCP_AVAILABLE and self.config.mcp.enabled:
+            await self._initialize_mcp()
+
+    async def _initialize_mcp(self) -> None:
+        """Initialize the MCP Integration Layer."""
+        mcp_config = self.config.mcp
+
+        try:
+            # Create registry and credentials manager
+            registry = ServerRegistry(mcp_config.config_path)
+            credentials = CredentialManager(mcp_config.credentials_path)
+
+            # Create and initialize MCP manager
+            self._mcp_manager = MCPManager(
+                registry=registry,
+                credentials=credentials,
+                health_check_interval=mcp_config.health_check_interval,
+                auto_reconnect=mcp_config.auto_reconnect,
+                max_reconnect_attempts=mcp_config.max_reconnect_attempts,
+            )
+            await self._mcp_manager.initialize()
+            self._update_health("mcp", SystemStatus.READY)
+
+            # Bridge MCP tools to AION's tool system
+            if self._tool_orchestrator:
+                bridge = self._mcp_manager.get_tool_bridge()
+                bridge.register_with_orchestrator(self._tool_orchestrator)
+
+            # Optionally serve as MCP server
+            if mcp_config.serve_as_mcp_server:
+                self._mcp_server = MCPServer(
+                    kernel=self,
+                    server_name=mcp_config.mcp_server_name,
+                    server_version=mcp_config.mcp_server_version,
+                )
+                setup_aion_mcp_server(self._mcp_server, self)
+                self._update_health("mcp_server", SystemStatus.READY)
+
+            logger.info(
+                "MCP Integration initialized successfully",
+                servers_connected=len(self._mcp_manager.get_connected_servers()),
+            )
+
+        except Exception as e:
+            logger.error("MCP Integration initialization failed", error=str(e))
+            self._update_health("mcp", SystemStatus.ERROR, str(e))
 
     async def _initialize_process_manager(self) -> None:
         """Initialize the Process & Agent Manager system."""
@@ -487,6 +547,10 @@ class AIONKernel:
             await self._resource_manager.shutdown()
         if self._event_bus:
             await self._event_bus.shutdown()
+
+        # Shutdown MCP integration
+        if self._mcp_manager:
+            await self._mcp_manager.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -917,3 +981,25 @@ Output a JSON array of steps, each with:
     def audio(self):
         """Get the auditory cortex."""
         return self._audio_cortex
+
+    # ==================== MCP Integration Access ====================
+
+    @property
+    def mcp(self):
+        """Get the MCP manager for external tool integration."""
+        return self._mcp_manager
+
+    @property
+    def mcp_server(self):
+        """Get the MCP server (when AION is serving as MCP server)."""
+        return self._mcp_server
+
+    def get_mcp_stats(self) -> dict[str, Any]:
+        """Get MCP integration statistics."""
+        if not self._mcp_manager:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._mcp_manager.get_stats(),
+        }
