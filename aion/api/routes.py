@@ -1249,3 +1249,316 @@ def setup_audio_routes(app: FastAPI, audio_cortex) -> None:
             speakers = await audio_cortex.memory.get_registered_speakers()
             return {"speakers": [s.to_dict() for s in speakers]}
         return {"speakers": []}
+
+
+# ==================== MCP Integration Routes ====================
+
+class MCPServerConnectRequest(BaseModel):
+    """Request to connect to an MCP server."""
+    name: str = Field(..., description="Server name from registry")
+
+
+class MCPToolCallRequest(BaseModel):
+    """Request to call an MCP tool."""
+    server: str = Field(..., description="Server name")
+    tool: str = Field(..., description="Tool name")
+    arguments: dict = Field(default_factory=dict, description="Tool arguments")
+
+
+class MCPResourceReadRequest(BaseModel):
+    """Request to read an MCP resource."""
+    server: str = Field(..., description="Server name")
+    uri: str = Field(..., description="Resource URI")
+
+
+class MCPPromptGetRequest(BaseModel):
+    """Request to get an MCP prompt."""
+    server: str = Field(..., description="Server name")
+    name: str = Field(..., description="Prompt name")
+    arguments: Optional[dict] = Field(default=None, description="Prompt arguments")
+
+
+class MCPServerRegisterRequest(BaseModel):
+    """Request to register a new MCP server."""
+    name: str = Field(..., description="Server name")
+    transport: str = Field(default="stdio", description="Transport type")
+    command: Optional[str] = None
+    args: list[str] = Field(default_factory=list)
+    env: dict = Field(default_factory=dict)
+    url: Optional[str] = None
+    ws_url: Optional[str] = None
+    headers: dict = Field(default_factory=dict)
+    description: Optional[str] = None
+    tags: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+def setup_mcp_routes(app: FastAPI, mcp_manager) -> None:
+    """Setup routes for MCP integration."""
+
+    @app.get("/mcp/status")
+    async def mcp_status():
+        """Get MCP integration status."""
+        return {
+            "enabled": True,
+            "stats": mcp_manager.get_stats(),
+        }
+
+    @app.get("/mcp/servers")
+    async def list_mcp_servers():
+        """List all configured MCP servers."""
+        states = mcp_manager.get_server_states()
+        return {
+            "servers": [
+                {
+                    "name": name,
+                    "connected": state.connected,
+                    "tools_count": len(state.tools),
+                    "resources_count": len(state.resources),
+                    "prompts_count": len(state.prompts),
+                    "last_connected": state.last_connected.isoformat() if state.last_connected else None,
+                    "last_error": state.last_error,
+                }
+                for name, state in states.items()
+            ]
+        }
+
+    @app.get("/mcp/servers/available")
+    async def list_available_servers():
+        """List all servers in the registry (including not connected)."""
+        all_servers = mcp_manager.registry.get_all_servers()
+        connected = set(mcp_manager.get_connected_servers())
+
+        return {
+            "servers": [
+                {
+                    "name": s.name,
+                    "transport": s.transport.value,
+                    "description": s.description,
+                    "enabled": s.enabled,
+                    "connected": s.name in connected,
+                    "tags": s.tags,
+                }
+                for s in all_servers
+            ]
+        }
+
+    @app.post("/mcp/servers/connect")
+    async def connect_mcp_server(request: MCPServerConnectRequest):
+        """Connect to an MCP server."""
+        try:
+            success = await mcp_manager.connect_server(request.name)
+            state = mcp_manager.get_server_state(request.name)
+            return {
+                "success": success,
+                "server": request.name,
+                "tools_count": len(state.tools) if state else 0,
+                "resources_count": len(state.resources) if state else 0,
+                "prompts_count": len(state.prompts) if state else 0,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/mcp/servers/{name}/disconnect")
+    async def disconnect_mcp_server(name: str):
+        """Disconnect from an MCP server."""
+        success = await mcp_manager.disconnect_server(name)
+        return {"success": success, "server": name}
+
+    @app.post("/mcp/servers/{name}/reconnect")
+    async def reconnect_mcp_server(name: str):
+        """Reconnect to an MCP server."""
+        try:
+            success = await mcp_manager.reconnect_server(name)
+            return {"success": success, "server": name}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/mcp/servers/{name}/ping")
+    async def ping_mcp_server(name: str):
+        """Ping an MCP server."""
+        result = await mcp_manager.ping_server(name)
+        return {"server": name, "reachable": result}
+
+    @app.get("/mcp/servers/{name}/state")
+    async def get_server_state(name: str):
+        """Get detailed state of a specific server."""
+        state = mcp_manager.get_server_state(name)
+        if not state:
+            raise HTTPException(status_code=404, detail=f"Server not found: {name}")
+        return state.to_dict()
+
+    @app.post("/mcp/servers/register")
+    async def register_mcp_server(request: MCPServerRegisterRequest):
+        """Register a new MCP server configuration."""
+        from aion.mcp.types import ServerConfig, TransportType
+
+        config = ServerConfig(
+            name=request.name,
+            transport=TransportType(request.transport),
+            command=request.command,
+            args=request.args,
+            env=request.env,
+            url=request.url,
+            ws_url=request.ws_url,
+            headers=request.headers,
+            description=request.description,
+            tags=request.tags,
+            enabled=request.enabled,
+        )
+        mcp_manager.registry.register(config)
+        return {"success": True, "server": request.name}
+
+    @app.delete("/mcp/servers/{name}")
+    async def unregister_mcp_server(name: str):
+        """Unregister an MCP server."""
+        await mcp_manager.disconnect_server(name)
+        success = mcp_manager.registry.unregister(name)
+        return {"success": success, "server": name}
+
+    @app.post("/mcp/servers/{name}/enable")
+    async def enable_mcp_server(name: str):
+        """Enable an MCP server."""
+        success = mcp_manager.registry.enable_server(name)
+        return {"success": success, "server": name}
+
+    @app.post("/mcp/servers/{name}/disable")
+    async def disable_mcp_server(name: str):
+        """Disable an MCP server."""
+        success = mcp_manager.registry.disable_server(name)
+        return {"success": success, "server": name}
+
+    # === Tool Routes ===
+
+    @app.get("/mcp/tools")
+    async def list_mcp_tools(server: Optional[str] = None):
+        """List all MCP tools (optionally filter by server)."""
+        all_tools = mcp_manager.list_all_tools()
+
+        if server:
+            tools = all_tools.get(server, [])
+            return {
+                "server": server,
+                "tools": [t.to_dict() for t in tools],
+            }
+
+        return {
+            "tools": {
+                name: [t.to_dict() for t in tools]
+                for name, tools in all_tools.items()
+            }
+        }
+
+    @app.get("/mcp/tools/flat")
+    async def list_mcp_tools_flat():
+        """List all MCP tools as a flat list."""
+        tools = mcp_manager.get_tools_flat()
+        return {
+            "tools": [
+                {
+                    "server": server_name,
+                    "name": tool.name,
+                    "description": tool.description,
+                    "full_name": f"{server_name}:{tool.name}",
+                }
+                for server_name, tool in tools
+            ]
+        }
+
+    @app.post("/mcp/tools/call")
+    async def call_mcp_tool(request: MCPToolCallRequest):
+        """Call an MCP tool."""
+        try:
+            result = await mcp_manager.call_tool(
+                request.server,
+                request.tool,
+                request.arguments,
+            )
+            return result.to_dict()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/mcp/tools/call-by-name")
+    async def call_mcp_tool_by_name(
+        full_name: str = Body(..., description="Full tool name (server:tool or just tool)"),
+        arguments: dict = Body(default_factory=dict),
+    ):
+        """Call an MCP tool by full name."""
+        try:
+            result = await mcp_manager.call_tool_by_name(full_name, arguments)
+            return result.to_dict()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    # === Resource Routes ===
+
+    @app.get("/mcp/resources")
+    async def list_mcp_resources(server: Optional[str] = None):
+        """List all MCP resources."""
+        all_resources = mcp_manager.list_all_resources()
+
+        if server:
+            resources = all_resources.get(server, [])
+            return {
+                "server": server,
+                "resources": [r.to_dict() for r in resources],
+            }
+
+        return {
+            "resources": {
+                name: [r.to_dict() for r in resources]
+                for name, resources in all_resources.items()
+            }
+        }
+
+    @app.post("/mcp/resources/read")
+    async def read_mcp_resource(request: MCPResourceReadRequest):
+        """Read an MCP resource."""
+        try:
+            content = await mcp_manager.read_resource(request.server, request.uri)
+            return content.to_dict()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    # === Prompt Routes ===
+
+    @app.get("/mcp/prompts")
+    async def list_mcp_prompts(server: Optional[str] = None):
+        """List all MCP prompts."""
+        all_prompts = mcp_manager.list_all_prompts()
+
+        if server:
+            prompts = all_prompts.get(server, [])
+            return {
+                "server": server,
+                "prompts": [p.to_dict() for p in prompts],
+            }
+
+        return {
+            "prompts": {
+                name: [p.to_dict() for p in prompts]
+                for name, prompts in all_prompts.items()
+            }
+        }
+
+    @app.post("/mcp/prompts/get")
+    async def get_mcp_prompt(request: MCPPromptGetRequest):
+        """Get an MCP prompt."""
+        try:
+            messages = await mcp_manager.get_prompt(
+                request.server,
+                request.name,
+                request.arguments,
+            )
+            return {
+                "messages": [m.to_dict() for m in messages],
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    # === Statistics ===
+
+    @app.get("/mcp/stats")
+    async def mcp_stats():
+        """Get MCP manager statistics."""
+        return mcp_manager.get_stats()

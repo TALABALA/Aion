@@ -167,6 +167,22 @@ class MonitoringConfig(BaseModel):
     alert_threshold_error_rate: float = 0.05
 
 
+class MCPConfig(BaseModel):
+    """Configuration for the MCP Integration Layer."""
+    enabled: bool = True
+    config_path: Path = Path("./config/mcp_servers.json")
+    credentials_path: Path = Path("./config/mcp_credentials.json")
+    auto_reconnect: bool = True
+    health_check_interval: float = 30.0
+    default_timeout: float = 30.0
+    max_reconnect_attempts: int = 3
+
+    # Server mode settings (when AION acts as MCP server)
+    serve_as_mcp_server: bool = False
+    mcp_server_name: str = "aion"
+    mcp_server_version: str = "1.0.0"
+
+
 class ProcessConfig(BaseModel):
     """Configuration for the Process & Agent Manager System."""
     # Supervisor settings
@@ -257,6 +273,7 @@ class AIONConfig(BaseSettings):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     process: ProcessConfig = Field(default_factory=ProcessConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     # Data paths
     data_dir: Path = Field(default=Path("./data"))
