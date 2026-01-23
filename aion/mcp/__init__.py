@@ -130,6 +130,71 @@ from aion.mcp.bridge import (
     MCPPromptBridge,
 )
 
+# SOTA resilience patterns
+from aion.mcp.resilience import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerError,
+    CircuitState,
+    ExponentialBackoff,
+    BackoffConfig,
+    retry_with_backoff,
+    RetryExhaustedError,
+    TokenBucketRateLimiter,
+    SlidingWindowRateLimiter,
+    RateLimitExceededError,
+    LRUCache,
+    RequestDeduplicator,
+    Bulkhead,
+    BulkheadFullError,
+    ResiliencePolicy,
+    ResilienceConfig,
+)
+
+# Observability
+from aion.mcp.metrics import (
+    MCPTracer,
+    MCPMetrics,
+    MCPHealthChecker,
+    HealthStatus,
+    HealthCheckResult,
+    init_observability,
+    get_tracer,
+    get_metrics,
+)
+
+# Schema validation
+from aion.mcp.validation import (
+    SchemaValidator,
+    ToolArgumentValidator,
+    TypeCoercer,
+    ValidationResult,
+    ValidationError,
+    SchemaValidationError,
+    validate_tool_arguments,
+)
+
+# Streaming and progress
+from aion.mcp.streaming import (
+    ProgressState,
+    ProgressUpdate,
+    ProgressNotifier,
+    ProgressContext,
+    StreamChunk,
+    StreamError,
+    StreamMetadata,
+    StreamingToolResult,
+    StreamProducer,
+    BufferedStreamConsumer,
+    ToolResultStreamer,
+    ProgressStore,
+    get_progress_store,
+    with_progress,
+)
+
+# Manager configuration
+from aion.mcp.manager import MCPManagerConfig
+
 __all__ = [
     # Version
     "MCP_PROTOCOL_VERSION",
@@ -242,4 +307,61 @@ __all__ = [
     "MCPToolBridge",
     "MCPResourceBridge",
     "MCPPromptBridge",
+
+    # Resilience Patterns
+    "CircuitBreaker",
+    "CircuitBreakerConfig",
+    "CircuitBreakerError",
+    "CircuitState",
+    "ExponentialBackoff",
+    "BackoffConfig",
+    "retry_with_backoff",
+    "RetryExhaustedError",
+    "TokenBucketRateLimiter",
+    "SlidingWindowRateLimiter",
+    "RateLimitExceededError",
+    "LRUCache",
+    "RequestDeduplicator",
+    "Bulkhead",
+    "BulkheadFullError",
+    "ResiliencePolicy",
+    "ResilienceConfig",
+
+    # Observability
+    "MCPTracer",
+    "MCPMetrics",
+    "MCPHealthChecker",
+    "HealthStatus",
+    "HealthCheckResult",
+    "init_observability",
+    "get_tracer",
+    "get_metrics",
+
+    # Validation
+    "SchemaValidator",
+    "ToolArgumentValidator",
+    "TypeCoercer",
+    "ValidationResult",
+    "ValidationError",
+    "SchemaValidationError",
+    "validate_tool_arguments",
+
+    # Streaming and Progress
+    "ProgressState",
+    "ProgressUpdate",
+    "ProgressNotifier",
+    "ProgressContext",
+    "StreamChunk",
+    "StreamError",
+    "StreamMetadata",
+    "StreamingToolResult",
+    "StreamProducer",
+    "BufferedStreamConsumer",
+    "ToolResultStreamer",
+    "ProgressStore",
+    "get_progress_store",
+    "with_progress",
+
+    # Manager Configuration
+    "MCPManagerConfig",
 ]

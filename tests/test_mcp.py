@@ -804,5 +804,733 @@ class TestErrorHandling:
         assert "unknown/method" in error.message
 
 
+# ==================== SOTA Feature Tests ====================
+
+# Import SOTA modules
+from aion.mcp.resilience import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerError,
+    CircuitState,
+    ExponentialBackoff,
+    BackoffConfig,
+    retry_with_backoff,
+    RetryExhaustedError,
+    TokenBucketRateLimiter,
+    RateLimitExceededError,
+    LRUCache,
+    RequestDeduplicator,
+    Bulkhead,
+    BulkheadFullError,
+)
+
+from aion.mcp.validation import (
+    SchemaValidator,
+    ToolArgumentValidator,
+    TypeCoercer,
+    ValidationResult,
+    SchemaValidationError,
+    validate_tool_arguments,
+)
+
+from aion.mcp.streaming import (
+    ProgressState,
+    ProgressUpdate,
+    ProgressNotifier,
+    ProgressContext,
+    StreamChunk,
+    StreamingToolResult,
+    ToolResultStreamer,
+    ProgressStore,
+    get_progress_store,
+)
+
+from aion.mcp.metrics import (
+    MCPTracer,
+    MCPMetrics,
+    MCPHealthChecker,
+    HealthStatus,
+    HealthCheckResult,
+)
+
+
+class TestCircuitBreaker:
+    """Test Circuit Breaker pattern."""
+
+    @pytest.fixture
+    def circuit(self):
+        """Create circuit breaker with low thresholds for testing."""
+        return CircuitBreaker(
+            name="test_cb",
+            config=CircuitBreakerConfig(
+                failure_threshold=3,
+                success_threshold=2,
+                timeout=1.0,
+            ),
+        )
+
+    def test_initial_state_closed(self, circuit):
+        """Test circuit starts in closed state."""
+        assert circuit.state == CircuitState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_opens_after_failures(self, circuit):
+        """Test circuit opens after failure threshold."""
+        for _ in range(3):
+            try:
+                async with circuit:
+                    raise ValueError("Simulated failure")
+            except ValueError:
+                pass
+
+        assert circuit.state == CircuitState.OPEN
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_open(self, circuit):
+        """Test circuit rejects requests when open."""
+        # Force open
+        for _ in range(3):
+            try:
+                async with circuit:
+                    raise ValueError("Simulated failure")
+            except ValueError:
+                pass
+
+        with pytest.raises(CircuitBreakerError):
+            async with circuit:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_success_resets_failures(self, circuit):
+        """Test successful calls reset failure count."""
+        # Two failures
+        for _ in range(2):
+            try:
+                async with circuit:
+                    raise ValueError("Failure")
+            except ValueError:
+                pass
+
+        # One success should reset
+        async with circuit:
+            pass
+
+        assert circuit._failure_count == 0
+
+    def test_stats(self, circuit):
+        """Test circuit breaker statistics."""
+        stats = circuit.get_stats()
+
+        assert stats["name"] == "test_cb"
+        assert stats["state"] == "closed"
+        assert "failure_count" in stats
+
+
+class TestExponentialBackoff:
+    """Test Exponential Backoff."""
+
+    def test_default_config(self):
+        """Test default backoff configuration."""
+        backoff = ExponentialBackoff()
+
+        assert backoff.config.base_delay == 1.0
+        assert backoff.config.max_delay == 60.0
+        assert backoff.config.max_retries == 5
+
+    def test_delay_increases(self):
+        """Test delay increases exponentially."""
+        backoff = ExponentialBackoff(BackoffConfig(
+            base_delay=1.0,
+            multiplier=2.0,
+            jitter=0.0,
+            jitter_mode="equal",  # Use equal to reduce randomness
+        ))
+
+        delay0 = backoff.calculate_delay(0)
+        delay1 = backoff.calculate_delay(1)
+        delay2 = backoff.calculate_delay(2)
+
+        # Due to jitter, we check approximate values
+        assert delay1 > delay0 * 0.9
+        assert delay2 > delay1 * 0.9
+
+    def test_max_delay_cap(self):
+        """Test delay is capped at max_delay."""
+        backoff = ExponentialBackoff(BackoffConfig(
+            base_delay=1.0,
+            max_delay=5.0,
+            multiplier=10.0,
+            jitter=0.0,
+        ))
+
+        delay = backoff.calculate_delay(10)
+        assert delay <= 5.0
+
+    @pytest.mark.asyncio
+    async def test_retry_with_backoff_success(self):
+        """Test retry eventually succeeds."""
+        call_count = 0
+
+        async def eventually_succeeds():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ValueError("Not yet")
+            return "success"
+
+        result = await retry_with_backoff(
+            eventually_succeeds,
+            config=BackoffConfig(base_delay=0.01, max_retries=5),
+        )
+
+        assert result == "success"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_exhausted(self):
+        """Test retry raises after exhaustion."""
+        async def always_fails():
+            raise ValueError("Always fails")
+
+        with pytest.raises(RetryExhaustedError):
+            await retry_with_backoff(
+                always_fails,
+                config=BackoffConfig(base_delay=0.01, max_retries=2),
+            )
+
+
+class TestRateLimiter:
+    """Test Rate Limiter."""
+
+    @pytest.fixture
+    def limiter(self):
+        """Create rate limiter for testing."""
+        return TokenBucketRateLimiter(
+            name="test_rl",
+            rate=10.0,  # 10 tokens per second
+            capacity=5,  # Burst of 5
+        )
+
+    @pytest.mark.asyncio
+    async def test_allows_burst(self, limiter):
+        """Test allows burst up to capacity."""
+        for _ in range(5):
+            result = await limiter.acquire(block=False)
+            assert result is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_over_capacity(self, limiter):
+        """Test rejects when over capacity."""
+        # Exhaust capacity
+        for _ in range(5):
+            await limiter.acquire(block=False)
+
+        # Should reject
+        with pytest.raises(RateLimitExceededError):
+            await limiter.acquire(block=False)
+
+    def test_stats(self, limiter):
+        """Test rate limiter statistics."""
+        stats = limiter.get_stats()
+
+        assert stats["name"] == "test_rl"
+        assert stats["rate"] == 10.0
+        assert stats["capacity"] == 5
+
+
+class TestLRUCache:
+    """Test LRU Cache."""
+
+    @pytest.fixture
+    def cache(self):
+        """Create LRU cache for testing."""
+        return LRUCache[str](
+            name="test_cache",
+            max_size=3,
+            default_ttl=10.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_get(self, cache):
+        """Test basic set and get."""
+        await cache.set("key1", "value1")
+        result = await cache.get("key1")
+
+        assert result == "value1"
+
+    @pytest.mark.asyncio
+    async def test_miss(self, cache):
+        """Test cache miss returns None."""
+        result = await cache.get("nonexistent")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_eviction_on_capacity(self, cache):
+        """Test LRU eviction when at capacity."""
+        await cache.set("a", "1")
+        await cache.set("b", "2")
+        await cache.set("c", "3")
+        await cache.set("d", "4")  # Should evict "a"
+
+        assert await cache.get("a") is None
+        assert await cache.get("d") == "4"
+
+    @pytest.mark.asyncio
+    async def test_delete(self, cache):
+        """Test deleting cache entry."""
+        await cache.set("key", "value")
+        await cache.delete("key")
+
+        assert await cache.get("key") is None
+
+    def test_stats(self, cache):
+        """Test cache statistics."""
+        stats = cache.get_stats()
+
+        assert stats["name"] == "test_cache"
+        assert stats["max_size"] == 3
+
+
+class TestBulkhead:
+    """Test Bulkhead pattern."""
+
+    @pytest.fixture
+    def bulkhead(self):
+        """Create bulkhead for testing."""
+        return Bulkhead(
+            name="test_bh",
+            max_concurrent=2,
+        )
+
+    @pytest.mark.asyncio
+    async def test_allows_under_limit(self, bulkhead):
+        """Test allows requests under limit."""
+        async with bulkhead:
+            async with bulkhead:
+                assert bulkhead._current == 2
+
+    @pytest.mark.asyncio
+    async def test_rejects_at_capacity(self, bulkhead):
+        """Test rejects at capacity."""
+        async with bulkhead:
+            async with bulkhead:
+                with pytest.raises(BulkheadFullError):
+                    await bulkhead.acquire()
+
+    def test_stats(self, bulkhead):
+        """Test bulkhead statistics."""
+        stats = bulkhead.get_stats()
+
+        assert stats["name"] == "test_bh"
+        assert stats["max_concurrent"] == 2
+
+
+class TestSchemaValidator:
+    """Test Schema Validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create schema validator for testing."""
+        return SchemaValidator(coerce_types=True, apply_defaults=True)
+
+    def test_valid_data(self, validator):
+        """Test validation of valid data."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name"],
+        }
+
+        result = validator.validate({"name": "Alice", "age": 30}, schema)
+
+        assert result.valid
+        assert len(result.errors) == 0
+
+    def test_missing_required(self, validator):
+        """Test validation catches missing required field."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+            },
+            "required": ["name"],
+        }
+
+        result = validator.validate({}, schema)
+
+        assert not result.valid
+        assert any("name" in e.path for e in result.errors)
+
+    def test_type_coercion(self, validator):
+        """Test type coercion."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer"},
+            },
+        }
+
+        result = validator.validate({"count": "42"}, schema)
+
+        assert result.valid
+        assert result.coerced_data["count"] == 42
+
+    def test_default_values(self, validator):
+        """Test default value application."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "default": "Unknown"},
+            },
+        }
+
+        result = validator.validate({}, schema)
+
+        assert result.coerced_data["name"] == "Unknown"
+
+
+class TestTypeCoercer:
+    """Test Type Coercer."""
+
+    def test_string_coercion(self):
+        """Test coercing to string."""
+        assert TypeCoercer.coerce_string(123) == "123"
+        assert TypeCoercer.coerce_string(True) == "True"
+
+    def test_integer_coercion(self):
+        """Test coercing to integer."""
+        assert TypeCoercer.coerce_integer("42") == 42
+        assert TypeCoercer.coerce_integer(3.0) == 3
+        assert TypeCoercer.coerce_integer("invalid") is None
+
+    def test_boolean_coercion(self):
+        """Test coercing to boolean."""
+        assert TypeCoercer.coerce_boolean("true") is True
+        assert TypeCoercer.coerce_boolean("false") is False
+        assert TypeCoercer.coerce_boolean("yes") is True
+        assert TypeCoercer.coerce_boolean(1) is True
+
+
+class TestToolArgumentValidator:
+    """Test Tool Argument Validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create tool argument validator."""
+        return ToolArgumentValidator()
+
+    def test_validate_tool_arguments(self, validator):
+        """Test validating tool arguments."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        }
+
+        result = validator.validate_tool_arguments(
+            "test_tool",
+            {"query": "search term"},
+            schema,
+        )
+
+        assert result.valid
+        assert result.coerced_data["limit"] == 10
+
+    def test_prepare_arguments_raises(self, validator):
+        """Test prepare_arguments raises on invalid."""
+        schema = {
+            "type": "object",
+            "properties": {"required_field": {"type": "string"}},
+            "required": ["required_field"],
+        }
+
+        with pytest.raises(SchemaValidationError):
+            validator.prepare_arguments("test_tool", {}, schema)
+
+
+class TestProgressNotifier:
+    """Test Progress Notifier."""
+
+    @pytest.fixture
+    def progress(self):
+        """Create progress notifier for testing."""
+        return ProgressNotifier(
+            total_steps=10,
+            description="Test operation",
+        )
+
+    @pytest.mark.asyncio
+    async def test_initial_state(self, progress):
+        """Test initial progress state."""
+        assert progress._state == ProgressState.PENDING
+        assert progress.progress == 0.0
+
+    @pytest.mark.asyncio
+    async def test_start(self, progress):
+        """Test starting progress."""
+        await progress.start()
+        assert progress._state == ProgressState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_update_progress(self, progress):
+        """Test updating progress."""
+        await progress.start()
+        await progress.update(increment=5)
+
+        assert progress._current_step == 5
+        assert progress.progress == 0.5
+
+    @pytest.mark.asyncio
+    async def test_complete(self, progress):
+        """Test completing progress."""
+        await progress.start()
+        await progress.complete()
+
+        assert progress._state == ProgressState.COMPLETED
+        assert progress.progress == 1.0
+
+    @pytest.mark.asyncio
+    async def test_fail(self, progress):
+        """Test failing progress."""
+        await progress.start()
+        await progress.fail("Something went wrong")
+
+        assert progress._state == ProgressState.FAILED
+
+    @pytest.mark.asyncio
+    async def test_subscriber_notification(self, progress):
+        """Test subscriber receives notifications."""
+        updates = []
+
+        def on_update(update: ProgressUpdate):
+            updates.append(update)
+
+        progress.subscribe(on_update)
+        await progress.start()
+        await progress.update(increment=1)
+
+        assert len(updates) >= 2
+
+
+class TestProgressContext:
+    """Test Progress Context Manager."""
+
+    @pytest.mark.asyncio
+    async def test_context_complete(self):
+        """Test context manager on successful completion."""
+        updates = []
+
+        async with ProgressContext(
+            "Test task",
+            total=5,
+            on_progress=updates.append,
+        ) as progress:
+            for i in range(5):
+                await progress.update(increment=1)
+
+        # Should have start + 5 updates + complete
+        assert len(updates) >= 5
+        assert updates[-1].state == ProgressState.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_context_failure(self):
+        """Test context manager on failure."""
+        updates = []
+
+        with pytest.raises(ValueError):
+            async with ProgressContext(
+                "Failing task",
+                on_progress=updates.append,
+            ) as progress:
+                raise ValueError("Error")
+
+        assert updates[-1].state == ProgressState.FAILED
+
+
+class TestStreamingToolResult:
+    """Test Streaming Tool Result."""
+
+    @pytest.mark.asyncio
+    async def test_send_and_iterate(self):
+        """Test sending and iterating over chunks."""
+        result = StreamingToolResult()
+        await result.start()
+
+        # Send in background
+        async def send_chunks():
+            for i in range(3):
+                await result.send(f"chunk_{i}")
+            await result.complete()
+
+        asyncio.create_task(send_chunks())
+
+        chunks = []
+        async for chunk in result:
+            chunks.append(chunk.data)
+
+        assert len(chunks) == 3
+        assert chunks == ["chunk_0", "chunk_1", "chunk_2"]
+
+    @pytest.mark.asyncio
+    async def test_stats(self):
+        """Test streaming statistics."""
+        result = StreamingToolResult()
+        await result.start()
+
+        await result.send("data")
+        await result.complete()
+
+        stats = result.get_stats()
+        assert stats["chunks_sent"] == 1
+        assert stats["completed"] is True
+
+
+class TestProgressStore:
+    """Test Progress Store."""
+
+    @pytest.fixture
+    def store(self):
+        """Create progress store for testing."""
+        return ProgressStore(max_entries=10)
+
+    @pytest.mark.asyncio
+    async def test_create_and_get(self, store):
+        """Test creating and getting progress."""
+        notifier = await store.create(
+            total_steps=100,
+            description="Test",
+        )
+
+        retrieved = await store.get(notifier.operation_id)
+        assert retrieved is notifier
+
+    @pytest.mark.asyncio
+    async def test_get_status(self, store):
+        """Test getting operation status."""
+        notifier = await store.create(description="Test")
+        await notifier.start()
+
+        status = await store.get_status(notifier.operation_id)
+        assert status is not None
+        assert status.state == ProgressState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_list_active(self, store):
+        """Test listing active operations."""
+        n1 = await store.create(description="Active 1")
+        n2 = await store.create(description="Active 2")
+
+        await n1.start()
+        await n2.start()
+
+        active = await store.list_active()
+        assert len(active) == 2
+
+
+class TestRequestDeduplicator:
+    """Test Request Deduplicator."""
+
+    @pytest.fixture
+    def dedup(self):
+        """Create deduplicator for testing."""
+        return RequestDeduplicator(name="test_dedup", ttl=1.0)
+
+    @pytest.mark.asyncio
+    async def test_deduplication(self, dedup):
+        """Test identical concurrent requests are deduplicated."""
+        call_count = 0
+
+        async def expensive_operation(x):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.1)
+            return x * 2
+
+        # Run two identical requests concurrently
+        result1, result2 = await asyncio.gather(
+            dedup.execute(expensive_operation, 5),
+            dedup.execute(expensive_operation, 5),
+        )
+
+        assert result1 == result2 == 10
+        assert call_count == 1  # Only executed once
+
+    @pytest.mark.asyncio
+    async def test_different_args_not_deduplicated(self, dedup):
+        """Test different arguments are not deduplicated."""
+        call_count = 0
+
+        async def operation(x):
+            nonlocal call_count
+            call_count += 1
+            return x
+
+        # Run with different args
+        result1, result2 = await asyncio.gather(
+            dedup.execute(operation, 1),
+            dedup.execute(operation, 2),
+        )
+
+        assert result1 == 1
+        assert result2 == 2
+        assert call_count == 2
+
+
+class TestMCPMetrics:
+    """Test MCP Metrics."""
+
+    @pytest.fixture
+    def metrics(self):
+        """Create metrics for testing."""
+        return MCPMetrics(namespace="test_mcp")
+
+    def test_record_connection(self, metrics):
+        """Test recording connection."""
+        # Should not raise even if Prometheus not available
+        metrics.record_connection(
+            server="test",
+            transport="stdio",
+            success=True,
+            duration=0.5,
+        )
+
+    def test_record_tool_call(self, metrics):
+        """Test recording tool call."""
+        metrics.record_tool_call(
+            server="test",
+            tool="example_tool",
+            success=True,
+            duration=0.1,
+        )
+
+
+class TestHealthCheck:
+    """Test Health Check."""
+
+    def test_health_status_values(self):
+        """Test health status enum values."""
+        assert HealthStatus.HEALTHY.value == "healthy"
+        assert HealthStatus.DEGRADED.value == "degraded"
+        assert HealthStatus.UNHEALTHY.value == "unhealthy"
+
+    def test_health_check_result(self):
+        """Test health check result creation."""
+        result = HealthCheckResult(
+            name="test_check",
+            status=HealthStatus.HEALTHY,
+            message="All good",
+        )
+
+        d = result.to_dict()
+        assert d["name"] == "test_check"
+        assert d["status"] == "healthy"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
