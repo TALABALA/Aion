@@ -183,6 +183,55 @@ class MCPConfig(BaseModel):
     mcp_server_version: str = "1.0.0"
 
 
+class KnowledgeGraphConfig(BaseModel):
+    """Configuration for the Knowledge Graph System."""
+    # Storage settings
+    store_type: Literal["sqlite", "memory"] = "sqlite"
+    database_path: Optional[Path] = None  # Defaults to data_dir/knowledge.db
+
+    # Embedding settings
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_dimension: int = 384
+
+    # Query settings
+    default_query_limit: int = 100
+    max_query_limit: int = 1000
+    query_cache_size: int = 1000
+    query_cache_ttl: int = 300  # seconds
+
+    # Inference settings
+    enable_inference: bool = True
+    inference_depth: int = 3
+    confidence_threshold: float = 0.5
+    max_inference_iterations: int = 100
+
+    # Hybrid search settings
+    vector_weight: float = 0.4
+    graph_weight: float = 0.3
+    text_weight: float = 0.3
+    diversity_weight: float = 0.3
+    use_reranking: bool = True
+
+    # Extraction settings
+    enable_extraction: bool = True
+    extraction_min_confidence: float = 0.5
+    extraction_max_entities: int = 50
+    extraction_max_relationships: int = 100
+
+    # Graph analysis settings
+    enable_centrality: bool = True
+    enable_community_detection: bool = True
+    pagerank_damping: float = 0.85
+
+    # Temporal settings
+    enable_temporal: bool = True
+    default_temporal_scope: bool = False  # If True, only return currently valid facts
+
+    # Schema settings
+    schema_validation: bool = True
+    schema_path: Optional[Path] = None
+
+
 class ProcessConfig(BaseModel):
     """Configuration for the Process & Agent Manager System."""
     # Supervisor settings
@@ -274,6 +323,7 @@ class AIONConfig(BaseSettings):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     process: ProcessConfig = Field(default_factory=ProcessConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)
 
     # Data paths
     data_dir: Path = Field(default=Path("./data"))
