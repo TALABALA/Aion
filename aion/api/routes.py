@@ -124,6 +124,88 @@ class EmitEventRequest(BaseModel):
     payload: dict = Field(..., description="Event payload")
 
 
+# Knowledge Graph Request/Response Models
+class KGEntityCreateRequest(BaseModel):
+    """Request to create an entity in the knowledge graph."""
+    name: str = Field(..., description="Entity name")
+    entity_type: str = Field(default="concept", description="Entity type")
+    description: str = Field(default="", description="Entity description")
+    properties: dict = Field(default_factory=dict, description="Entity properties")
+    aliases: list[str] = Field(default_factory=list, description="Alternative names")
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    importance: float = Field(default=0.5, ge=0, le=1)
+
+
+class KGEntityUpdateRequest(BaseModel):
+    """Request to update an entity."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    properties: Optional[dict] = None
+    aliases: Optional[list[str]] = None
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    importance: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class KGRelationshipCreateRequest(BaseModel):
+    """Request to create a relationship."""
+    source_id: str = Field(..., description="Source entity ID")
+    target_id: str = Field(..., description="Target entity ID")
+    relation_type: str = Field(..., description="Relationship type")
+    properties: dict = Field(default_factory=dict)
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    weight: float = Field(default=1.0, ge=0)
+    bidirectional: bool = Field(default=False)
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+
+
+class KGQueryRequest(BaseModel):
+    """Request to query the knowledge graph."""
+    query: str = Field(..., description="Query string (Cypher-like or natural language)")
+    natural_language: bool = Field(default=False, description="Use natural language translation")
+    limit: int = Field(default=100, ge=1, le=1000)
+    include_paths: bool = Field(default=False)
+    include_subgraph: bool = Field(default=False)
+
+
+class KGSearchRequest(BaseModel):
+    """Request for hybrid search."""
+    query: str = Field(..., description="Search query")
+    limit: int = Field(default=10, ge=1, le=100)
+    entity_types: Optional[list[str]] = None
+    vector_weight: float = Field(default=0.4, ge=0, le=1)
+    graph_weight: float = Field(default=0.3, ge=0, le=1)
+    text_weight: float = Field(default=0.3, ge=0, le=1)
+    min_confidence: float = Field(default=0.0, ge=0, le=1)
+    use_reranking: bool = Field(default=True)
+
+
+class KGPathRequest(BaseModel):
+    """Request to find paths between entities."""
+    source_id: str = Field(..., description="Source entity ID")
+    target_id: str = Field(..., description="Target entity ID")
+    max_depth: int = Field(default=5, ge=1, le=10)
+    relation_types: Optional[list[str]] = None
+    algorithm: str = Field(default="bfs", description="Path algorithm: bfs, dijkstra, dfs")
+
+
+class KGExtractionRequest(BaseModel):
+    """Request to extract entities from text."""
+    text: str = Field(..., description="Text to extract entities from")
+    context: Optional[str] = Field(default=None, description="Additional context")
+    add_to_graph: bool = Field(default=True, description="Add extracted entities to graph")
+    source_id: Optional[str] = Field(default=None, description="Source document ID")
+    min_confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class KGInferenceRequest(BaseModel):
+    """Request to run inference on the graph."""
+    rules: Optional[list[str]] = Field(default=None, description="Specific rules to run")
+    entity_ids: Optional[list[str]] = Field(default=None, description="Entities to focus on")
+    max_iterations: int = Field(default=100, ge=1, le=1000)
+    confidence_threshold: float = Field(default=0.5, ge=0, le=1)
+
+
 # ==================== Route Setup Functions ====================
 
 def setup_routes(app: FastAPI, kernel) -> None:
@@ -2121,3 +2203,353 @@ def setup_multi_agent_routes(app: FastAPI, kernel) -> None:
         }
 
     logger.info("Multi-agent routes initialized")
+
+
+def setup_knowledge_graph_routes(app: FastAPI, knowledge_manager) -> None:
+    """Setup routes for the Knowledge Graph system."""
+
+    # ==================== Entity Operations ====================
+
+    @app.post("/knowledge/entities")
+    async def create_entity(request: KGEntityCreateRequest):
+        """Create a new entity in the knowledge graph."""
+        from aion.systems.knowledge.types import Entity, EntityType
+
+        try:
+            entity_type = EntityType(request.entity_type.upper())
+        except ValueError:
+            entity_type = EntityType.CONCEPT
+
+        entity = Entity(
+            name=request.name,
+            entity_type=entity_type,
+            description=request.description,
+            properties=request.properties,
+            aliases=request.aliases,
+            confidence=request.confidence,
+            importance=request.importance,
+        )
+
+        created = await knowledge_manager.add_entity(entity)
+        return {"entity": created.to_dict(), "id": created.id}
+
+    @app.get("/knowledge/entities/{entity_id}")
+    async def get_entity(entity_id: str):
+        """Get an entity by ID."""
+        entity = await knowledge_manager.get_entity(entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        return {"entity": entity.to_dict()}
+
+    @app.get("/knowledge/entities")
+    async def list_entities(
+        entity_type: Optional[str] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+    ):
+        """List entities with optional filtering."""
+        entities = await knowledge_manager.list_entities(
+            entity_type=entity_type,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "entities": [e.to_dict() for e in entities],
+            "count": len(entities),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.put("/knowledge/entities/{entity_id}")
+    async def update_entity(entity_id: str, request: KGEntityUpdateRequest):
+        """Update an existing entity."""
+        entity = await knowledge_manager.get_entity(entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        # Apply updates
+        if request.name is not None:
+            entity.name = request.name
+        if request.description is not None:
+            entity.description = request.description
+        if request.properties is not None:
+            entity.properties.update(request.properties)
+        if request.aliases is not None:
+            entity.aliases = request.aliases
+        if request.confidence is not None:
+            entity.confidence = request.confidence
+        if request.importance is not None:
+            entity.importance = request.importance
+
+        updated = await knowledge_manager.update_entity(entity)
+        return {"entity": updated.to_dict()}
+
+    @app.delete("/knowledge/entities/{entity_id}")
+    async def delete_entity(entity_id: str):
+        """Delete an entity and its relationships."""
+        success = await knowledge_manager.delete_entity(entity_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        return {"success": True, "deleted_id": entity_id}
+
+    # ==================== Relationship Operations ====================
+
+    @app.post("/knowledge/relationships")
+    async def create_relationship(request: KGRelationshipCreateRequest):
+        """Create a new relationship between entities."""
+        from aion.systems.knowledge.types import Relationship, RelationType
+
+        try:
+            relation_type = RelationType(request.relation_type.upper())
+        except ValueError:
+            relation_type = RelationType.RELATED_TO
+
+        relationship = Relationship(
+            source_id=request.source_id,
+            target_id=request.target_id,
+            relation_type=relation_type,
+            properties=request.properties,
+            confidence=request.confidence,
+            weight=request.weight,
+            bidirectional=request.bidirectional,
+            valid_from=request.valid_from,
+            valid_until=request.valid_until,
+        )
+
+        created = await knowledge_manager.add_relationship(relationship)
+        return {"relationship": created.to_dict(), "id": created.id}
+
+    @app.get("/knowledge/relationships/{entity_id}")
+    async def get_entity_relationships(
+        entity_id: str,
+        direction: str = Query(default="both", description="outgoing, incoming, or both"),
+        relation_type: Optional[str] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        """Get relationships for an entity."""
+        relationships = await knowledge_manager.get_relationships(
+            entity_id=entity_id,
+            direction=direction,
+            relation_type=relation_type,
+            limit=limit,
+        )
+        return {
+            "relationships": [r.to_dict() for r in relationships],
+            "count": len(relationships),
+        }
+
+    @app.delete("/knowledge/relationships/{relationship_id}")
+    async def delete_relationship(relationship_id: str):
+        """Delete a relationship."""
+        success = await knowledge_manager.delete_relationship(relationship_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Relationship not found")
+        return {"success": True, "deleted_id": relationship_id}
+
+    # ==================== Query Operations ====================
+
+    @app.post("/knowledge/query")
+    async def query_graph(request: KGQueryRequest):
+        """Execute a query against the knowledge graph."""
+        result = await knowledge_manager.query(
+            query=request.query,
+            natural_language=request.natural_language,
+            limit=request.limit,
+        )
+        return {
+            "entities": [e.to_dict() for e in result.entities],
+            "relationships": [r.to_dict() for r in result.relationships],
+            "paths": [p.to_dict() for p in result.paths] if request.include_paths else [],
+            "count": result.total_count,
+            "execution_time_ms": result.execution_time_ms,
+        }
+
+    @app.post("/knowledge/search")
+    async def hybrid_search(request: KGSearchRequest):
+        """Perform hybrid search combining vector, graph, and text search."""
+        results = await knowledge_manager.search(
+            query=request.query,
+            limit=request.limit,
+            entity_types=request.entity_types,
+            vector_weight=request.vector_weight,
+            graph_weight=request.graph_weight,
+            text_weight=request.text_weight,
+            min_confidence=request.min_confidence,
+            use_reranking=request.use_reranking,
+        )
+        return {
+            "results": [
+                {
+                    "entity": r.entity.to_dict(),
+                    "score": r.combined_score,
+                    "vector_score": r.vector_score,
+                    "graph_score": r.graph_score,
+                    "text_score": r.text_score,
+                }
+                for r in results
+            ],
+            "count": len(results),
+        }
+
+    # ==================== Path Finding ====================
+
+    @app.post("/knowledge/path")
+    async def find_path(request: KGPathRequest):
+        """Find paths between two entities."""
+        paths = await knowledge_manager.find_path(
+            source_id=request.source_id,
+            target_id=request.target_id,
+            max_depth=request.max_depth,
+            relation_types=request.relation_types,
+            algorithm=request.algorithm,
+        )
+        return {
+            "paths": [p.to_dict() for p in paths],
+            "count": len(paths),
+        }
+
+    # ==================== Entity Extraction ====================
+
+    @app.post("/knowledge/extract")
+    async def extract_entities(request: KGExtractionRequest):
+        """Extract entities and relationships from text."""
+        result = await knowledge_manager.extract_and_add(
+            text=request.text,
+            context=request.context,
+            add_to_graph=request.add_to_graph,
+            source_id=request.source_id,
+            min_confidence=request.min_confidence,
+        )
+        return {
+            "entities": [e.to_dict() for e in result.entities],
+            "relationships": [r.to_dict() for r in result.relationships],
+            "added_to_graph": request.add_to_graph,
+        }
+
+    # ==================== Inference ====================
+
+    @app.post("/knowledge/inference")
+    async def run_inference(request: KGInferenceRequest):
+        """Run inference rules on the knowledge graph."""
+        results = await knowledge_manager.run_inference(
+            rules=request.rules,
+            entity_ids=request.entity_ids,
+            max_iterations=request.max_iterations,
+            confidence_threshold=request.confidence_threshold,
+        )
+        return {
+            "inferred_relationships": [r.to_dict() for r in results],
+            "count": len(results),
+        }
+
+    # ==================== Graph Analysis ====================
+
+    @app.get("/knowledge/centrality/{entity_id}")
+    async def get_entity_centrality(entity_id: str):
+        """Get centrality metrics for an entity."""
+        metrics = await knowledge_manager.compute_centrality(entity_id)
+        return {
+            "entity_id": entity_id,
+            "metrics": metrics,
+        }
+
+    @app.get("/knowledge/neighbors/{entity_id}")
+    async def get_neighbors(
+        entity_id: str,
+        depth: int = Query(default=1, ge=1, le=5),
+        relation_types: Optional[str] = Query(default=None),
+    ):
+        """Get neighboring entities up to a certain depth."""
+        rel_types = relation_types.split(",") if relation_types else None
+        neighbors = await knowledge_manager.get_neighbors(
+            entity_id=entity_id,
+            depth=depth,
+            relation_types=rel_types,
+        )
+        return {
+            "entity_id": entity_id,
+            "neighbors": [n.to_dict() for n in neighbors],
+            "depth": depth,
+        }
+
+    @app.get("/knowledge/subgraph/{entity_id}")
+    async def get_subgraph(
+        entity_id: str,
+        depth: int = Query(default=2, ge=1, le=5),
+    ):
+        """Get a subgraph centered on an entity."""
+        subgraph = await knowledge_manager.get_subgraph(
+            entity_id=entity_id,
+            depth=depth,
+        )
+        return {
+            "entities": [e.to_dict() for e in subgraph.entities],
+            "relationships": [r.to_dict() for r in subgraph.relationships],
+            "center_entity_id": entity_id,
+        }
+
+    # ==================== Statistics and Management ====================
+
+    @app.get("/knowledge/stats")
+    async def get_stats():
+        """Get knowledge graph statistics."""
+        stats = await knowledge_manager.get_stats()
+        return stats.to_dict() if hasattr(stats, "to_dict") else stats
+
+    @app.get("/knowledge/types/entities")
+    async def list_entity_types():
+        """List available entity types."""
+        from aion.systems.knowledge.types import EntityType
+        return {
+            "types": [
+                {"name": et.value, "category": et.get_category()}
+                for et in EntityType
+            ]
+        }
+
+    @app.get("/knowledge/types/relations")
+    async def list_relation_types():
+        """List available relation types."""
+        from aion.systems.knowledge.types import RelationType
+        return {
+            "types": [
+                {
+                    "name": rt.value,
+                    "properties": RelationType.get_properties().get(rt.value, {}),
+                }
+                for rt in RelationType
+            ]
+        }
+
+    @app.post("/knowledge/export")
+    async def export_graph(
+        format: str = Query(default="json", description="Export format: json, rdf, graphml"),
+        entity_types: Optional[str] = Query(default=None),
+    ):
+        """Export the knowledge graph."""
+        entity_type_list = entity_types.split(",") if entity_types else None
+        data = await knowledge_manager.export_graph(
+            format=format,
+            entity_types=entity_type_list,
+        )
+        return JSONResponse(content=data)
+
+    @app.post("/knowledge/import")
+    async def import_graph(
+        data: dict = Body(...),
+        format: str = Query(default="json"),
+        merge: bool = Query(default=True, description="Merge with existing data"),
+    ):
+        """Import data into the knowledge graph."""
+        result = await knowledge_manager.import_graph(
+            data=data,
+            format=format,
+            merge=merge,
+        )
+        return {
+            "imported_entities": result.get("entities", 0),
+            "imported_relationships": result.get("relationships", 0),
+            "merged": merge,
+        }
+
+    logger.info("Knowledge graph routes initialized")
