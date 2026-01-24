@@ -109,6 +109,13 @@ from aion.systems.agents.archetypes import (
     ExecutorAgent,
 )
 
+# SOTA Orchestrator (State-of-the-Art enhancements)
+from aion.systems.agents.sota_orchestrator import (
+    SOTAOrchestrator,
+    SOTAConfig,
+    AgentEnhancements,
+)
+
 __all__ = [
     # === Core Enums ===
     "AgentRole",
@@ -161,4 +168,9 @@ __all__ = [
     "ReviewerAgent",
     "PlannerAgent",
     "ExecutorAgent",
+
+    # === SOTA Orchestrator ===
+    "SOTAOrchestrator",
+    "SOTAConfig",
+    "AgentEnhancements",
 ]
