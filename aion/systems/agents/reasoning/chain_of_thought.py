@@ -185,7 +185,7 @@ class ChainOfThought:
     Chain-of-Thought reasoning system.
 
     Features:
-    - Step-by-step reasoning generation
+    - Step-by-step reasoning generation using Llama 3.3 70B
     - Self-consistency voting
     - Verification chains
     - Least-to-most decomposition
@@ -194,13 +194,28 @@ class ChainOfThought:
 
     def __init__(
         self,
+        agent_id: Optional[str] = None,
         config: Optional[CoTConfig] = None,
         generate_fn: Optional[GenerateFn] = None,
     ):
+        self.agent_id = agent_id or "default"
         self.config = config or CoTConfig()
-        self.generate_fn = generate_fn
+        self._custom_generate_fn = generate_fn
+        self._llm_provider = None
 
         self._chain_counter = 0
+
+    async def _get_llm_provider(self):
+        """Get or create LLM provider for reasoning."""
+        if self._llm_provider is None:
+            from aion.systems.agents.llm_integration import SOTALLMProvider
+            self._llm_provider = await SOTALLMProvider.get_instance()
+        return self._llm_provider
+
+    @property
+    def generate_fn(self):
+        """Backward compatibility property."""
+        return self._custom_generate_fn
 
     async def reason(
         self,
@@ -252,7 +267,7 @@ class ChainOfThought:
         context: Optional[str],
         subproblems: Optional[list[str]] = None,
     ) -> ReasoningChain:
-        """Generate a single reasoning chain."""
+        """Generate a single reasoning chain using Llama 3.3 70B."""
         self._chain_counter += 1
         chain = ReasoningChain(
             id=f"cot-{self._chain_counter}",
@@ -269,11 +284,12 @@ class ChainOfThought:
                 )
 
         # Generate main reasoning
-        if self.generate_fn:
+        if self._custom_generate_fn:
+            # Use custom function if provided
             prompt = self.config.cot_prompt_template.format(
                 problem=f"{problem}\n\nContext: {context}" if context else problem
             )
-            response = await self.generate_fn(prompt)
+            response = await self._custom_generate_fn(prompt)
             steps = self._parse_reasoning_steps(response)
 
             for step_type, content in steps:
@@ -285,20 +301,48 @@ class ChainOfThought:
             # Extract final answer
             chain.final_answer = self._extract_answer(response)
         else:
-            # Fallback: simple heuristic reasoning
-            chain.add_step(
-                reasoning_type=ReasoningType.OBSERVATION,
-                content=f"Analyzing the problem: {problem[:100]}",
-            )
-            chain.add_step(
-                reasoning_type=ReasoningType.INFERENCE,
-                content="Based on the observations, we can infer...",
-            )
-            chain.add_step(
-                reasoning_type=ReasoningType.CONCLUSION,
-                content="Therefore, the answer is...",
-            )
-            chain.final_answer = "Answer based on reasoning"
+            # Use real LLM provider (Llama 3.3 70B)
+            try:
+                llm_provider = await self._get_llm_provider()
+                reasoning_steps = await llm_provider.generate_cot_reasoning(problem, context)
+
+                for i, step_content in enumerate(reasoning_steps):
+                    # Determine step type heuristically
+                    step_lower = step_content.lower()
+                    if any(w in step_lower for w in ["observe", "note", "see", "given"]):
+                        step_type = ReasoningType.OBSERVATION
+                    elif any(w in step_lower for w in ["calculate", "compute", "=", "+"]):
+                        step_type = ReasoningType.CALCULATION
+                    elif any(w in step_lower for w in ["therefore", "thus", "conclude", "answer"]):
+                        step_type = ReasoningType.CONCLUSION
+                    elif any(w in step_lower for w in ["verify", "check", "confirm"]):
+                        step_type = ReasoningType.VERIFICATION
+                    elif any(w in step_lower for w in ["hypothesis", "assume", "suppose"]):
+                        step_type = ReasoningType.HYPOTHESIS
+                    else:
+                        step_type = ReasoningType.INFERENCE
+
+                    chain.add_step(
+                        reasoning_type=step_type,
+                        content=step_content,
+                    )
+
+                # Extract final answer using LLM
+                if reasoning_steps:
+                    chain.final_answer = await llm_provider.extract_answer(reasoning_steps, problem)
+
+            except Exception as e:
+                logger.warning("cot_llm_fallback", error=str(e))
+                # Fallback if LLM fails
+                chain.add_step(
+                    reasoning_type=ReasoningType.OBSERVATION,
+                    content=f"Analyzing: {problem[:100]}",
+                )
+                chain.add_step(
+                    reasoning_type=ReasoningType.INFERENCE,
+                    content="Based on the analysis...",
+                )
+                chain.final_answer = "Unable to generate complete reasoning"
 
         # Calculate overall confidence
         if chain.steps:

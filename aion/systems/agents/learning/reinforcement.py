@@ -251,8 +251,9 @@ class ReinforcementLearner:
     - Policy gradient updates
     - Value function learning
     - Exploration-exploitation balance
-    - Reward shaping
+    - Reward shaping with LLM feedback
     - Multi-objective rewards
+    - LLM-based action outcome evaluation
     """
 
     def __init__(
@@ -260,10 +261,18 @@ class ReinforcementLearner:
         agent_id: str,
         config: Optional[RLConfig] = None,
         available_actions: Optional[list[str]] = None,
+        learning_rate: float = 0.1,
+        exploration_rate: float = 0.1,
     ):
         self.agent_id = agent_id
-        self.config = config or RLConfig()
+        self.config = config or RLConfig(
+            learning_rate=learning_rate,
+            exploration_initial=exploration_rate,
+        )
         self.available_actions = available_actions or []
+
+        # LLM provider for reward evaluation
+        self._llm_provider = None
 
         # Experience replay buffer
         self._replay_buffer: deque[Experience] = deque(maxlen=self.config.buffer_size)
@@ -290,9 +299,21 @@ class ReinforcementLearner:
 
         self._initialized = False
 
+    async def _get_llm_provider(self):
+        """Get or create LLM provider for reward evaluation."""
+        if self._llm_provider is None:
+            try:
+                from aion.systems.agents.llm_integration import SOTALLMProvider
+                self._llm_provider = await SOTALLMProvider.get_instance()
+            except Exception as e:
+                logger.warning("llm_provider_init_failed", error=str(e))
+        return self._llm_provider
+
     async def initialize(self) -> None:
         """Initialize reinforcement learner."""
         self._initialized = True
+        # Pre-initialize LLM provider
+        await self._get_llm_provider()
         logger.info("reinforcement_learner_initialized", agent_id=self.agent_id)
 
     async def shutdown(self) -> None:
@@ -373,6 +394,74 @@ class ReinforcementLearner:
                     exp.priority = (abs(td_error) + 0.01) ** self.config.priority_alpha
 
                 break
+
+    async def evaluate_action_with_llm(
+        self,
+        state: dict[str, Any],
+        action: str,
+        outcome: dict[str, Any],
+    ) -> float:
+        """
+        Evaluate an action's outcome using Llama 3.3 70B.
+
+        This provides intelligent reward shaping based on LLM understanding
+        of the task context and action quality.
+
+        Args:
+            state: State before action
+            action: Action taken
+            outcome: Result of action
+
+        Returns:
+            Reward signal from -1.0 to 1.0
+        """
+        try:
+            llm_provider = await self._get_llm_provider()
+            if llm_provider:
+                reward = await llm_provider.evaluate_action_outcome(state, action, outcome)
+                return reward
+            return 0.0
+        except Exception as e:
+            logger.warning("llm_reward_evaluation_error", error=str(e))
+            return 0.0
+
+    async def record_experience_with_llm_evaluation(
+        self,
+        state: dict[str, Any],
+        action: str,
+        outcome: dict[str, Any],
+        next_state: Optional[dict[str, Any]] = None,
+        done: bool = False,
+    ) -> Experience:
+        """
+        Record an experience with LLM-based reward evaluation.
+
+        Automatically evaluates the action outcome using Llama 3.3 70B
+        to generate intelligent reward signals.
+
+        Args:
+            state: State before action
+            action: Action taken
+            outcome: Result/output of the action
+            next_state: State after action
+            done: Whether episode ended
+
+        Returns:
+            Recorded experience with LLM-evaluated reward
+        """
+        # Evaluate reward using LLM
+        reward = await self.evaluate_action_with_llm(state, action, outcome)
+
+        # Record with evaluated reward
+        return await self.record_experience(
+            state=state,
+            action=action,
+            reward=reward,
+            next_state=next_state,
+            done=done,
+            reward_type=RewardType.SELF_EVALUATION,
+            info={"llm_evaluated": True, "outcome": str(outcome)[:200]},
+        )
 
     def select_action(
         self,

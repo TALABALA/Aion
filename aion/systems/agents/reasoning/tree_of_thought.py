@@ -207,7 +207,7 @@ class TreeOfThought:
 
     Features:
     - Multiple search strategies (BFS, DFS, Beam, MCTS, Best-First)
-    - Dynamic thought generation
+    - Dynamic thought generation using Llama 3.3 70B
     - Path evaluation and pruning
     - Backtracking support
     - Parallel exploration
@@ -215,16 +215,37 @@ class TreeOfThought:
 
     def __init__(
         self,
+        agent_id: Optional[str] = None,
         config: Optional[ToTConfig] = None,
         generate_fn: Optional[GenerateFn] = None,
         evaluate_fn: Optional[EvaluateFn] = None,
+        max_depth: int = 5,
     ):
-        self.config = config or ToTConfig()
-        self.generate_fn = generate_fn
-        self.evaluate_fn = evaluate_fn
+        self.agent_id = agent_id or "default"
+        self.config = config or ToTConfig(max_depth=max_depth)
+        self._custom_generate_fn = generate_fn
+        self._custom_evaluate_fn = evaluate_fn
 
+        self._llm_provider = None
         self._node_counter = 0
         self._current_tree: Optional[ThoughtTree] = None
+
+    async def _get_llm_provider(self):
+        """Get or create LLM provider for thought generation."""
+        if self._llm_provider is None:
+            from aion.systems.agents.llm_integration import SOTALLMProvider
+            self._llm_provider = await SOTALLMProvider.get_instance()
+        return self._llm_provider
+
+    @property
+    def generate_fn(self):
+        """Backward compatibility property."""
+        return self._custom_generate_fn
+
+    @property
+    def evaluate_fn(self):
+        """Backward compatibility property."""
+        return self._custom_evaluate_fn
 
     async def solve(
         self,
@@ -310,43 +331,57 @@ class TreeOfThought:
         path: list[str],
         n: int,
     ) -> list[str]:
-        """Generate n possible next thoughts."""
-        if not self.generate_fn:
-            # Fallback: simple heuristic generation
-            return [f"Thought {i + 1}: Consider approach {i + 1}" for i in range(n)]
+        """Generate n possible next thoughts using Llama 3.3 70B."""
+        # Use custom function if provided
+        if self._custom_generate_fn:
+            path_str = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(path))
+            prompt = self.config.thought_prompt_template.format(
+                problem=problem,
+                path=path_str if path else "No steps yet.",
+            )
 
-        path_str = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(path))
-        prompt = self.config.thought_prompt_template.format(
-            problem=problem,
-            path=path_str if path else "No steps yet.",
-        )
+            thoughts = []
+            for _ in range(n):
+                try:
+                    thought = await self._custom_generate_fn(prompt)
+                    thoughts.append(thought.strip())
+                except Exception as e:
+                    logger.error("thought_generation_error", error=str(e))
 
-        thoughts = []
-        for _ in range(n):
-            try:
-                thought = await self.generate_fn(prompt)
-                thoughts.append(thought.strip())
-            except Exception as e:
-                logger.error("thought_generation_error", error=str(e))
+            return thoughts
 
-        return thoughts
+        # Use real LLM provider (Llama 3.3 70B)
+        try:
+            llm_provider = await self._get_llm_provider()
+            return await llm_provider.generate_thoughts(problem, path, n)
+        except Exception as e:
+            logger.warning("llm_thought_generation_fallback", error=str(e))
+            # Fallback only if LLM fails
+            return [f"Consider approach {i + 1} for: {problem[:50]}" for i in range(n)]
 
     async def _evaluate_path(
         self,
         problem: str,
         path: list[str],
     ) -> float:
-        """Evaluate a reasoning path."""
-        if not self.evaluate_fn:
-            # Fallback: heuristic evaluation based on path length
-            return min(1.0, len(path) * 0.1 + 0.3)
+        """Evaluate a reasoning path using Llama 3.3 70B."""
+        # Use custom function if provided
+        if self._custom_evaluate_fn:
+            try:
+                value = await self._custom_evaluate_fn(problem, path)
+                return max(0.0, min(1.0, value))
+            except Exception as e:
+                logger.error("path_evaluation_error", error=str(e))
+                return 0.5
 
+        # Use real LLM provider (Llama 3.3 70B)
         try:
-            value = await self.evaluate_fn(problem, path)
-            return max(0.0, min(1.0, value))
+            llm_provider = await self._get_llm_provider()
+            return await llm_provider.evaluate_reasoning_path(problem, path)
         except Exception as e:
-            logger.error("path_evaluation_error", error=str(e))
-            return 0.5
+            logger.warning("llm_evaluation_fallback", error=str(e))
+            # Fallback heuristic if LLM fails
+            return min(1.0, len(path) * 0.1 + 0.3)
 
     async def _bfs_search(self, problem: str, tree: ThoughtTree) -> None:
         """Breadth-first search."""

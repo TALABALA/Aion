@@ -95,6 +95,7 @@ class VectorStore:
     Features:
     - Multiple similarity metrics
     - HNSW approximate nearest neighbor search
+    - Real embeddings via Llama 3.3 70B or local embedding model
     - Metadata filtering
     - Automatic persistence
     - LRU-based memory management
@@ -102,13 +103,14 @@ class VectorStore:
 
     def __init__(
         self,
-        dimension: int = 1536,  # OpenAI embedding dimension
+        dimension: int = 1024,  # BGE-large dimension (configurable)
         metric: SimilarityMetric = SimilarityMetric.COSINE,
         max_elements: int = 100000,
         ef_construction: int = 200,  # HNSW construction parameter
         M: int = 16,  # HNSW max neighbors per node
         storage_path: Optional[Path] = None,
         embedding_fn: Optional[Callable[[str], list[float]]] = None,
+        use_llm_embeddings: bool = True,  # Use real LLM-based embeddings
     ):
         self.dimension = dimension
         self.metric = metric
@@ -116,7 +118,11 @@ class VectorStore:
         self.ef_construction = ef_construction
         self.M = M
         self.storage_path = storage_path
-        self.embedding_fn = embedding_fn
+        self._custom_embedding_fn = embedding_fn
+        self._use_llm_embeddings = use_llm_embeddings
+
+        # LLM provider for real embeddings
+        self._llm_provider = None
 
         # Storage
         self._entries: dict[str, VectorEntry] = {}
@@ -131,6 +137,21 @@ class VectorStore:
         self._initialized = False
         self._lock = asyncio.Lock()
 
+    @property
+    def embedding_fn(self):
+        """Backward compatibility property."""
+        return self._custom_embedding_fn
+
+    async def _get_llm_provider(self):
+        """Get or create LLM provider for embeddings."""
+        if self._llm_provider is None and self._use_llm_embeddings:
+            try:
+                from aion.systems.agents.llm_integration import SOTALLMProvider
+                self._llm_provider = await SOTALLMProvider.get_instance()
+            except Exception as e:
+                logger.warning("llm_provider_init_failed", error=str(e))
+        return self._llm_provider
+
     async def initialize(self) -> None:
         """Initialize the vector store."""
         if self._initialized:
@@ -139,8 +160,17 @@ class VectorStore:
         if self.storage_path and self.storage_path.exists():
             await self._load_from_disk()
 
+        # Pre-initialize LLM provider
+        if self._use_llm_embeddings:
+            await self._get_llm_provider()
+
         self._initialized = True
-        logger.info("vector_store_initialized", dimension=self.dimension, metric=self.metric.value)
+        logger.info(
+            "vector_store_initialized",
+            dimension=self.dimension,
+            metric=self.metric.value,
+            use_llm_embeddings=self._use_llm_embeddings,
+        )
 
     async def shutdown(self) -> None:
         """Shutdown and persist."""
@@ -190,18 +220,34 @@ class VectorStore:
         metadata: Optional[dict[str, Any]] = None,
         entry_id: Optional[str] = None,
     ) -> str:
-        """Add a vector entry to the store."""
+        """Add a vector entry to the store using real embeddings."""
         async with self._lock:
             # Generate embedding if not provided
             if vector is None:
-                if self.embedding_fn is None:
-                    # Use simple hash-based embedding for testing
-                    vector = self._simple_embedding(text)
+                if self._custom_embedding_fn is not None:
+                    # Use custom embedding function
+                    vector = self._custom_embedding_fn(text)
+                elif self._use_llm_embeddings:
+                    # Use real LLM-based embeddings
+                    try:
+                        llm_provider = await self._get_llm_provider()
+                        if llm_provider:
+                            vector = await llm_provider.generate_embedding(text)
+                        else:
+                            vector = self._simple_embedding(text)
+                    except Exception as e:
+                        logger.warning("embedding_generation_fallback", error=str(e))
+                        vector = self._simple_embedding(text)
                 else:
-                    vector = self.embedding_fn(text)
+                    # Fallback to simple hash-based embedding
+                    vector = self._simple_embedding(text)
 
+            # Adjust dimension if needed
             if len(vector) != self.dimension:
-                raise ValueError(f"Vector dimension {len(vector)} does not match store dimension {self.dimension}")
+                if len(vector) > self.dimension:
+                    vector = vector[:self.dimension]
+                else:
+                    vector = vector + [0.0] * (self.dimension - len(vector))
 
             # Generate ID if not provided
             if entry_id is None:
@@ -252,13 +298,30 @@ class VectorStore:
         metadata_filter: Optional[dict[str, Any]] = None,
         ef_search: int = 50,
     ) -> list[SearchResult]:
-        """Search for similar vectors."""
+        """Search for similar vectors using real embeddings."""
         # Get query vector
         if isinstance(query, str):
-            if self.embedding_fn:
-                query_vector = self.embedding_fn(query)
+            if self._custom_embedding_fn:
+                query_vector = self._custom_embedding_fn(query)
+            elif self._use_llm_embeddings:
+                try:
+                    llm_provider = await self._get_llm_provider()
+                    if llm_provider:
+                        query_vector = await llm_provider.generate_embedding(query)
+                    else:
+                        query_vector = self._simple_embedding(query)
+                except Exception as e:
+                    logger.warning("search_embedding_fallback", error=str(e))
+                    query_vector = self._simple_embedding(query)
             else:
                 query_vector = self._simple_embedding(query)
+
+            # Adjust dimension if needed
+            if len(query_vector) != self.dimension:
+                if len(query_vector) > self.dimension:
+                    query_vector = query_vector[:self.dimension]
+                else:
+                    query_vector = query_vector + [0.0] * (self.dimension - len(query_vector))
         else:
             query_vector = query
 

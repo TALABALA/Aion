@@ -151,7 +151,7 @@ class SelfReflection:
     Self-reflection system for iterative output improvement.
 
     Features:
-    - Multi-dimensional critique (accuracy, clarity, logic, etc.)
+    - Multi-dimensional critique using Llama 3.3 70B
     - Iterative refinement
     - Convergence detection
     - Critique severity weighting
@@ -160,13 +160,28 @@ class SelfReflection:
 
     def __init__(
         self,
+        agent_id: Optional[str] = None,
         config: Optional[ReflectionConfig] = None,
         generate_fn: Optional[GenerateFn] = None,
     ):
+        self.agent_id = agent_id or "default"
         self.config = config or ReflectionConfig()
-        self.generate_fn = generate_fn
+        self._custom_generate_fn = generate_fn
+        self._llm_provider = None
 
         self._reflection_count = 0
+
+    async def _get_llm_provider(self):
+        """Get or create LLM provider for reflection."""
+        if self._llm_provider is None:
+            from aion.systems.agents.llm_integration import SOTALLMProvider
+            self._llm_provider = await SOTALLMProvider.get_instance()
+        return self._llm_provider
+
+    @property
+    def generate_fn(self):
+        """Backward compatibility property."""
+        return self._custom_generate_fn
 
     async def reflect(
         self,
@@ -247,18 +262,45 @@ class SelfReflection:
         task: str,
         output: str,
     ) -> list[Critique]:
-        """Generate critiques for an output."""
-        if not self.generate_fn:
-            # Fallback: basic heuristic critiques
+        """Generate critiques for an output using Llama 3.3 70B."""
+        # Use custom function if provided
+        if self._custom_generate_fn:
+            prompt = self.config.critique_prompt_template.format(
+                task=task,
+                output=output,
+            )
+            response = await self._custom_generate_fn(prompt)
+            return self._parse_critiques(response)
+
+        # Use real LLM provider
+        try:
+            llm_provider = await self._get_llm_provider()
+            reflection = await llm_provider.reflect_on_output(task, output)
+
+            critiques = []
+            # Convert weaknesses to critiques
+            for weakness in reflection.get("weaknesses", []):
+                critiques.append(Critique(
+                    critique_type=CritiqueType.LOGIC,
+                    issue=weakness,
+                    severity=0.6,
+                    suggestion="Address this issue",
+                ))
+
+            # Add suggestions as critiques
+            for suggestion in reflection.get("suggestions", []):
+                critiques.append(Critique(
+                    critique_type=CritiqueType.COMPLETENESS,
+                    issue=f"Improvement needed: {suggestion}",
+                    severity=0.4,
+                    suggestion=suggestion,
+                ))
+
+            return critiques
+
+        except Exception as e:
+            logger.warning("critique_generation_fallback", error=str(e))
             return self._heuristic_critiques(output)
-
-        prompt = self.config.critique_prompt_template.format(
-            task=task,
-            output=output,
-        )
-
-        response = await self.generate_fn(prompt)
-        return self._parse_critiques(response)
 
     async def _generate_revision(
         self,
@@ -266,22 +308,28 @@ class SelfReflection:
         output: str,
         critiques: list[Critique],
     ) -> Optional[str]:
-        """Generate a revised output addressing critiques."""
-        if not self.generate_fn:
+        """Generate a revised output addressing critiques using Llama 3.3 70B."""
+        # Use custom function if provided
+        if self._custom_generate_fn:
+            critiques_text = "\n".join(
+                f"- [{c.critique_type.value.upper()}] {c.issue} (Severity: {c.severity:.1f})\n  Suggestion: {c.suggestion}"
+                for c in critiques
+            )
+            prompt = self.config.revision_prompt_template.format(
+                task=task,
+                output=output,
+                critiques=critiques_text,
+            )
+            return await self._custom_generate_fn(prompt)
+
+        # Use real LLM provider
+        try:
+            llm_provider = await self._get_llm_provider()
+            improved, _ = await llm_provider.critique_and_improve(task, output, max_iterations=1)
+            return improved
+        except Exception as e:
+            logger.warning("revision_generation_fallback", error=str(e))
             return None
-
-        critiques_text = "\n".join(
-            f"- [{c.critique_type.value.upper()}] {c.issue} (Severity: {c.severity:.1f})\n  Suggestion: {c.suggestion}"
-            for c in critiques
-        )
-
-        prompt = self.config.revision_prompt_template.format(
-            task=task,
-            output=output,
-            critiques=critiques_text,
-        )
-
-        return await self.generate_fn(prompt)
 
     def _parse_critiques(self, response: str) -> list[Critique]:
         """Parse critiques from LLM response."""
