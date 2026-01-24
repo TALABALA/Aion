@@ -1863,3 +1863,261 @@ def setup_goal_routes(app: FastAPI, kernel) -> None:
         return {"events": [e.to_dict() for e in events]}
 
     logger.info("Goal routes initialized")
+
+
+# ==================== Multi-Agent Orchestration Routes ====================
+
+class MultiAgentTaskRequest(BaseModel):
+    """Request to execute a multi-agent task."""
+    title: str = Field(..., description="Task title")
+    description: str = Field(..., description="Task description")
+    objective: str = Field(..., description="Task objective")
+    success_criteria: list[str] = Field(default_factory=list, description="Success criteria")
+    workflow: str = Field(default="sequential", description="Workflow pattern")
+    roles: Optional[list[str]] = Field(default=None, description="Agent roles to use")
+    max_iterations: int = Field(default=10, ge=1, le=50)
+    timeout: Optional[float] = Field(default=None, description="Timeout in seconds")
+
+
+class MultiAgentResearchRequest(BaseModel):
+    """Request for research task."""
+    topic: str = Field(..., description="Topic to research")
+    depth: str = Field(default="medium", description="Research depth")
+    questions: Optional[list[str]] = Field(default=None, description="Specific questions")
+
+
+class MultiAgentCodeRequest(BaseModel):
+    """Request for coding task."""
+    description: str = Field(..., description="What to implement")
+    language: str = Field(default="python", description="Programming language")
+    include_tests: bool = Field(default=True)
+    include_review: bool = Field(default=True)
+
+
+class MultiAgentAnalyzeRequest(BaseModel):
+    """Request for data analysis task."""
+    data_description: str = Field(..., description="Description of the data")
+    questions: list[str] = Field(..., description="Questions to answer")
+
+
+class MultiAgentDebateRequest(BaseModel):
+    """Request for debate task."""
+    topic: str = Field(..., description="Topic to debate")
+    positions: Optional[list[str]] = Field(default=None, description="Initial positions")
+    rounds: int = Field(default=3, ge=1, le=10)
+
+
+class MultiAgentWriteRequest(BaseModel):
+    """Request for writing task."""
+    topic: str = Field(..., description="Topic to write about")
+    content_type: str = Field(default="article", description="Type of content")
+    audience: str = Field(default="general", description="Target audience")
+    include_research: bool = Field(default=True)
+    include_review: bool = Field(default=True)
+
+
+class SpawnMultiAgentRequest(BaseModel):
+    """Request to spawn a specialist agent."""
+    role: str = Field(..., description="Agent role")
+    name: Optional[str] = Field(default=None, description="Custom name")
+
+
+def setup_multi_agent_routes(app: FastAPI, kernel) -> None:
+    """Setup routes for the Multi-Agent Orchestration System."""
+
+    # Check if multi-agent system is available
+    if not kernel.multi_agent:
+        logger.warning("Multi-agent orchestrator not initialized, skipping routes")
+        return
+
+    orchestrator = kernel.multi_agent
+
+    # === Task Execution ===
+
+    @app.post("/agents/tasks/execute")
+    async def execute_multi_agent_task(request: MultiAgentTaskRequest):
+        """Execute a multi-agent task with automatic team formation."""
+        from aion.systems.agents.types import WorkflowPattern, AgentRole
+
+        try:
+            workflow = WorkflowPattern(request.workflow)
+        except ValueError:
+            workflow = WorkflowPattern.SEQUENTIAL
+
+        roles = None
+        if request.roles:
+            try:
+                roles = [AgentRole(r) for r in request.roles]
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid role: {e}")
+
+        result = await orchestrator.execute_task(
+            title=request.title,
+            description=request.description,
+            objective=request.objective,
+            success_criteria=request.success_criteria,
+            workflow=workflow,
+            roles=roles,
+            max_iterations=request.max_iterations,
+            timeout=request.timeout,
+        )
+
+        return result
+
+    @app.post("/agents/research")
+    async def research_task(request: MultiAgentResearchRequest):
+        """Execute a research task with a research team."""
+        result = await orchestrator.research(
+            topic=request.topic,
+            depth=request.depth,
+            questions=request.questions,
+        )
+        return result
+
+    @app.post("/agents/code")
+    async def code_task(request: MultiAgentCodeRequest):
+        """Execute a coding task with a dev team."""
+        result = await orchestrator.code_task(
+            description=request.description,
+            language=request.language,
+            include_tests=request.include_tests,
+            include_review=request.include_review,
+        )
+        return result
+
+    @app.post("/agents/analyze")
+    async def analyze_task(request: MultiAgentAnalyzeRequest):
+        """Execute a data analysis task."""
+        result = await orchestrator.analyze_data(
+            data_description=request.data_description,
+            questions=request.questions,
+        )
+        return result
+
+    @app.post("/agents/write")
+    async def write_task(request: MultiAgentWriteRequest):
+        """Execute a writing task with a writing team."""
+        result = await orchestrator.write_content(
+            topic=request.topic,
+            content_type=request.content_type,
+            audience=request.audience,
+            include_research=request.include_research,
+            include_review=request.include_review,
+        )
+        return result
+
+    @app.post("/agents/debate")
+    async def debate_task(request: MultiAgentDebateRequest):
+        """Execute a debate task."""
+        result = await orchestrator.debate(
+            topic=request.topic,
+            positions=request.positions,
+            rounds=request.rounds,
+        )
+        return result
+
+    @app.post("/agents/plan")
+    async def plan_project(
+        project_description: str = Body(..., embed=True),
+        constraints: Optional[list[str]] = Body(default=None, embed=True),
+    ):
+        """Create a project plan."""
+        result = await orchestrator.plan_project(
+            project_description=project_description,
+            constraints=constraints,
+        )
+        return result
+
+    # === Agent Management ===
+
+    @app.get("/agents")
+    async def list_agents(
+        status: Optional[str] = Query(default=None),
+        role: Optional[str] = Query(default=None),
+    ):
+        """List all agents."""
+        from aion.systems.agents.types import AgentStatus, AgentRole
+
+        status_filter = None
+        if status:
+            try:
+                status_filter = AgentStatus(status)
+            except ValueError:
+                pass
+
+        role_filter = None
+        if role:
+            try:
+                role_filter = AgentRole(role)
+            except ValueError:
+                pass
+
+        agents = orchestrator.list_agents(status=status_filter, role=role_filter)
+        return {"agents": agents}
+
+    @app.post("/agents/spawn")
+    async def spawn_agent(request: SpawnMultiAgentRequest):
+        """Spawn a new specialist agent."""
+        from aion.systems.agents.types import AgentRole
+
+        try:
+            role = AgentRole(request.role)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid role: {request.role}")
+
+        agent = await orchestrator.spawn_agent(role=role, name=request.name)
+        return {"agent": agent}
+
+    @app.delete("/agents/{agent_id}")
+    async def terminate_agent(agent_id: str):
+        """Terminate an agent."""
+        success = await orchestrator.terminate_agent(agent_id)
+        return {"success": success}
+
+    # === Team Management ===
+
+    @app.get("/agents/teams")
+    async def list_teams(status: Optional[str] = Query(default=None)):
+        """List all teams."""
+        from aion.systems.agents.types import TeamStatus
+
+        status_filter = None
+        if status:
+            try:
+                status_filter = TeamStatus(status)
+            except ValueError:
+                pass
+
+        teams = orchestrator.list_teams(status=status_filter)
+        return {"teams": teams}
+
+    # === Statistics ===
+
+    @app.get("/agents/stats")
+    async def get_multi_agent_stats():
+        """Get multi-agent orchestrator statistics."""
+        return orchestrator.get_stats()
+
+    @app.get("/agents/roles")
+    async def list_available_roles():
+        """List available agent roles."""
+        from aion.systems.agents.types import AgentRole
+        return {
+            "roles": [
+                {"name": role.value, "is_specialist": role.is_specialist()}
+                for role in AgentRole
+            ]
+        }
+
+    @app.get("/agents/workflows")
+    async def list_available_workflows():
+        """List available workflow patterns."""
+        from aion.systems.agents.types import WorkflowPattern
+        return {
+            "workflows": [
+                {"name": pattern.value}
+                for pattern in WorkflowPattern
+            ]
+        }
+
+    logger.info("Multi-agent routes initialized")

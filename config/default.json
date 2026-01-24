@@ -2,22 +2,30 @@
   "instance_id": "aion-primary",
   "environment": "development",
   "host": "0.0.0.0",
-  "port": 8000,
+  "port": 8080,
   "debug": false,
 
   "llm": {
-    "provider": "openai",
-    "model": "gpt-4-turbo-preview",
+    "provider": "local",
+    "model": "meta-llama/Llama-3.3-70B-Instruct",
+    "base_url": "http://localhost:8000/v1",
     "max_tokens": 4096,
     "temperature": 0.7,
-    "timeout": 60.0,
+    "timeout": 120.0,
     "max_retries": 3
   },
 
+  "embedding": {
+    "provider": "local",
+    "model": "BAAI/bge-large-en-v1.5",
+    "base_url": "http://localhost:8001/v1",
+    "dimension": 1024
+  },
+
   "memory": {
-    "embedding_model": "all-MiniLM-L6-v2",
-    "embedding_dimension": 384,
-    "index_type": "flat",
+    "embedding_model": "BAAI/bge-large-en-v1.5",
+    "embedding_dimension": 1024,
+    "index_type": "hnsw",
     "max_memories": 100000,
     "consolidation_interval": 3600,
     "importance_threshold": 0.3,
