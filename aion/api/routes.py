@@ -3145,3 +3145,491 @@ def setup_observability_routes(app: FastAPI, observability_manager) -> None:
         return {"status": "flushed"}
 
     logger.info("Observability routes initialized")
+
+
+# ==================== Security Routes ====================
+
+class LoginRequest(BaseModel):
+    """Login request."""
+    username: str = Field(..., description="Username or email")
+    password: str = Field(..., description="Password")
+    mfa_code: Optional[str] = Field(default=None, description="MFA code if required")
+
+
+class RegisterRequest(BaseModel):
+    """User registration request."""
+    username: str = Field(..., description="Desired username")
+    email: str = Field(..., description="Email address")
+    password: str = Field(..., description="Password")
+    display_name: Optional[str] = Field(default=None, description="Display name")
+
+
+class CreateAPIKeyRequest(BaseModel):
+    """Create API key request."""
+    name: str = Field(..., description="Key name for identification")
+    scopes: list[str] = Field(default_factory=list, description="Permission scopes")
+    expires_in_days: Optional[int] = Field(default=None, description="Expiration in days")
+
+
+class CreateRoleRequest(BaseModel):
+    """Create role request."""
+    name: str
+    display_name: str
+    description: str = ""
+    permissions: list[str] = Field(default_factory=list)
+
+
+class CreatePolicyRequest(BaseModel):
+    """Create policy request."""
+    name: str
+    resource_type: str
+    actions: list[str]
+    effect: str = "allow"
+    roles: list[str] = Field(default_factory=list)
+    users: list[str] = Field(default_factory=list)
+
+
+class AuditQueryRequest(BaseModel):
+    """Audit log query request."""
+    user_id: Optional[str] = None
+    tenant_id: Optional[str] = None
+    resource_type: Optional[str] = None
+    event_type: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+def setup_security_routes(app: FastAPI, security_manager) -> None:
+    """Setup security and access control routes."""
+    from fastapi import Request, Depends
+    from aion.security.types import (
+        AuthMethod,
+        Credentials,
+        Permission,
+        PermissionAction,
+        PolicyEffect as PolicyEffectType,
+        TenantTier,
+    )
+    from aion.security.middleware import require_auth, require_admin
+
+    # ==================== Authentication ====================
+
+    @app.post("/auth/login")
+    async def login(request: LoginRequest, req: Request):
+        """Login and get access tokens."""
+        credentials = Credentials(
+            method=AuthMethod.BASIC,
+            username=request.username,
+            password=request.password,
+            mfa_code=request.mfa_code,
+        )
+
+        result = await security_manager.authenticate(
+            credentials,
+            ip_address=req.client.host if req.client else None,
+            user_agent=req.headers.get("user-agent"),
+        )
+
+        if result.status.value == "mfa_required":
+            return {
+                "status": "mfa_required",
+                "mfa_token": result.mfa_token,
+                "mfa_methods": [m.value for m in result.mfa_methods],
+            }
+
+        if result.status.value != "success":
+            raise HTTPException(
+                status_code=401,
+                detail=result.error_message or "Authentication failed",
+            )
+
+        return {
+            "access_token": result.access_token,
+            "refresh_token": result.refresh_token,
+            "token_type": "bearer",
+            "expires_in": result.expires_in,
+            "user": result.context.user.to_dict() if result.context and result.context.user else None,
+        }
+
+    @app.post("/auth/register")
+    async def register(request: RegisterRequest):
+        """Register a new user."""
+        try:
+            user = await security_manager.create_user(
+                username=request.username,
+                email=request.email,
+                password=request.password,
+            )
+            return {
+                "status": "success",
+                "user": user.to_dict(),
+                "message": "Registration successful. Please verify your email.",
+            }
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/auth/refresh")
+    async def refresh_tokens(
+        refresh_token: str = Body(..., embed=True),
+    ):
+        """Refresh access token using refresh token."""
+        result = await security_manager.auth.refresh_tokens(refresh_token)
+
+        if result.status.value != "success":
+            raise HTTPException(
+                status_code=401,
+                detail=result.error_message or "Token refresh failed",
+            )
+
+        return {
+            "access_token": result.access_token,
+            "refresh_token": result.refresh_token,
+            "token_type": "bearer",
+            "expires_in": result.expires_in,
+        }
+
+    @app.post("/auth/logout")
+    async def logout(req: Request):
+        """Logout current session."""
+        context = getattr(req.state, "security_context", None)
+
+        if context:
+            await security_manager.auth.logout(
+                session_id=context.session.session_id if context.session else None,
+                user_id=context.user_id,
+            )
+
+        return {"status": "success", "message": "Logged out successfully"}
+
+    @app.get("/auth/me")
+    async def get_current_user(req: Request, context=Depends(require_auth)):
+        """Get current authenticated user info."""
+        return {
+            "user": context.user.to_dict() if context.user else None,
+            "roles": context.roles,
+            "permissions": list(context.permissions)[:50],  # Limit for response size
+            "tenant_id": context.tenant_id,
+        }
+
+    # ==================== API Keys ====================
+
+    @app.post("/auth/api-keys")
+    async def create_api_key(
+        request: CreateAPIKeyRequest,
+        req: Request,
+        context=Depends(require_auth),
+    ):
+        """Create a new API key."""
+        raw_key, token = await security_manager.auth.create_api_key(
+            context.user,
+            name=request.name,
+            scopes=request.scopes,
+            expires_in_days=request.expires_in_days,
+        )
+
+        return {
+            "api_key": raw_key,
+            "token_id": token.token_id,
+            "name": request.name,
+            "scopes": request.scopes,
+            "expires_at": token.expires_at.isoformat() if token.expires_at else None,
+            "warning": "Store this key securely. It will not be shown again.",
+        }
+
+    @app.get("/auth/api-keys")
+    async def list_api_keys(context=Depends(require_auth)):
+        """List user's API keys."""
+        keys = await security_manager.auth.get_user_api_keys(context.user_id)
+        return {
+            "keys": [
+                {
+                    "token_id": k.token_id,
+                    "name": k.name,
+                    "prefix": k.token_prefix,
+                    "scopes": k.scopes,
+                    "created_at": k.created_at.isoformat(),
+                    "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+                    "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+                }
+                for k in keys
+            ],
+        }
+
+    @app.delete("/auth/api-keys/{token_id}")
+    async def revoke_api_key(token_id: str, context=Depends(require_auth)):
+        """Revoke an API key."""
+        success = await security_manager.auth.revoke_api_key(
+            token_id,
+            revoked_by=context.user_id,
+        )
+
+        if not success:
+            raise HTTPException(status_code=404, detail="API key not found")
+
+        return {"status": "revoked", "token_id": token_id}
+
+    # ==================== Sessions ====================
+
+    @app.get("/auth/sessions")
+    async def list_sessions(context=Depends(require_auth)):
+        """List user's active sessions."""
+        sessions = await security_manager.auth.sessions.get_user_sessions(context.user_id)
+        return {
+            "sessions": [s.to_dict() for s in sessions],
+            "count": len(sessions),
+        }
+
+    @app.delete("/auth/sessions/{session_id}")
+    async def terminate_session(session_id: str, context=Depends(require_auth)):
+        """Terminate a specific session."""
+        success = await security_manager.auth.sessions.terminate_session(
+            session_id,
+            reason="user_terminated",
+        )
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return {"status": "terminated", "session_id": session_id}
+
+    @app.post("/auth/sessions/terminate-all")
+    async def terminate_all_sessions(context=Depends(require_auth)):
+        """Terminate all sessions except current."""
+        current_session_id = context.session.session_id if context.session else None
+        count = await security_manager.auth.sessions.terminate_all_sessions(
+            context.user_id,
+            except_session_id=current_session_id,
+        )
+
+        return {"status": "success", "terminated_count": count}
+
+    # ==================== User Management (Admin) ====================
+
+    @app.get("/admin/users")
+    async def list_users(
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        context=Depends(require_admin),
+    ):
+        """List all users (admin only)."""
+        users = list(security_manager.auth._users.values())[offset:offset + limit]
+        return {
+            "users": [u.to_dict() for u in users],
+            "total": len(security_manager.auth._users),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/admin/users/{user_id}")
+    async def get_user(user_id: str, context=Depends(require_admin)):
+        """Get user details (admin only)."""
+        user = await security_manager.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user.to_dict(include_sensitive=True)
+
+    @app.delete("/admin/users/{user_id}")
+    async def delete_user(user_id: str, context=Depends(require_admin)):
+        """Delete a user (admin only)."""
+        success = await security_manager.auth.delete_user(user_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"status": "deleted", "user_id": user_id}
+
+    # ==================== Roles ====================
+
+    @app.get("/security/roles")
+    async def list_roles(context=Depends(require_auth)):
+        """List available roles."""
+        roles = list(security_manager.authz._roles.values())
+        return {
+            "roles": [r.to_dict() for r in roles],
+            "count": len(roles),
+        }
+
+    @app.post("/security/roles")
+    async def create_role(request: CreateRoleRequest, context=Depends(require_admin)):
+        """Create a new role (admin only)."""
+        permissions = [Permission.from_string(p) for p in request.permissions]
+
+        try:
+            role = await security_manager.create_role(
+                name=request.name,
+                display_name=request.display_name,
+                description=request.description,
+                permissions=permissions,
+            )
+            return {"status": "created", "role": role.to_dict()}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/security/roles/{role_id}")
+    async def get_role(role_id: str, context=Depends(require_auth)):
+        """Get role details."""
+        role = await security_manager.authz.get_role(role_id)
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found")
+        return role.to_dict()
+
+    # ==================== Policies ====================
+
+    @app.get("/security/policies")
+    async def list_policies(context=Depends(require_admin)):
+        """List access control policies (admin only)."""
+        policies = list(security_manager.authz._policies.values())
+        return {
+            "policies": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "resource_type": p.resource_type,
+                    "effect": p.effect.value,
+                    "enabled": p.enabled,
+                    "priority": p.priority,
+                }
+                for p in policies
+            ],
+            "count": len(policies),
+        }
+
+    @app.post("/security/policies")
+    async def create_policy(request: CreatePolicyRequest, context=Depends(require_admin)):
+        """Create a new access control policy (admin only)."""
+        try:
+            policy = await security_manager.create_policy(
+                name=request.name,
+                resource_type=request.resource_type,
+                actions=[PermissionAction(a) for a in request.actions],
+                effect=PolicyEffectType(request.effect),
+                roles=request.roles,
+                users=request.users,
+            )
+            return {"status": "created", "policy_id": policy.id}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.delete("/security/policies/{policy_id}")
+    async def delete_policy(policy_id: str, context=Depends(require_admin)):
+        """Delete a policy (admin only)."""
+        success = await security_manager.authz.delete_policy(policy_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        return {"status": "deleted", "policy_id": policy_id}
+
+    # ==================== Tenants ====================
+
+    @app.get("/security/tenants")
+    async def list_tenants(context=Depends(require_admin)):
+        """List all tenants (admin only)."""
+        tenants = list(security_manager.tenancy._tenants.values())
+        return {
+            "tenants": [t.to_dict() for t in tenants],
+            "count": len(tenants),
+        }
+
+    @app.post("/security/tenants")
+    async def create_tenant(
+        name: str = Body(...),
+        slug: str = Body(...),
+        tier: str = Body(default="free"),
+        context=Depends(require_admin),
+    ):
+        """Create a new tenant (admin only)."""
+        try:
+            tenant = await security_manager.create_tenant(
+                name=name,
+                slug=slug,
+                tier=TenantTier(tier),
+            )
+            return {"status": "created", "tenant": tenant.to_dict()}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/security/tenants/{tenant_id}")
+    async def get_tenant(tenant_id: str, context=Depends(require_admin)):
+        """Get tenant details (admin only)."""
+        tenant = await security_manager.get_tenant(tenant_id)
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        return tenant.to_dict()
+
+    @app.get("/security/tenants/{tenant_id}/usage")
+    async def get_tenant_usage(tenant_id: str, context=Depends(require_admin)):
+        """Get tenant usage statistics (admin only)."""
+        usage = await security_manager.tenancy.get_usage(tenant_id)
+        if not usage:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        tenant = await security_manager.get_tenant(tenant_id)
+        return {
+            "tenant_id": tenant_id,
+            "tier": tenant.tier.value if tenant else None,
+            "usage": {
+                "users": usage.current_users,
+                "storage_gb": usage.current_storage_gb,
+                "tokens_today": usage.tokens_used_today,
+                "requests_today": usage.requests_today,
+            },
+            "quotas": {
+                "max_users": tenant.quotas.max_users if tenant else None,
+                "max_storage_gb": tenant.quotas.max_storage_gb if tenant else None,
+                "max_tokens_per_day": tenant.quotas.max_tokens_per_day if tenant else None,
+            },
+        }
+
+    # ==================== Audit Logs ====================
+
+    @app.post("/security/audit/query")
+    async def query_audit_logs(request: AuditQueryRequest, context=Depends(require_admin)):
+        """Query audit logs (admin only)."""
+        from datetime import datetime
+
+        start_time = None
+        end_time = None
+
+        if request.start_time:
+            start_time = datetime.fromisoformat(request.start_time)
+        if request.end_time:
+            end_time = datetime.fromisoformat(request.end_time)
+
+        logs = await security_manager.query_audit_logs(
+            user_id=request.user_id,
+            tenant_id=request.tenant_id,
+            resource_type=request.resource_type,
+            start_time=start_time,
+            end_time=end_time,
+            limit=request.limit,
+        )
+
+        return {
+            "logs": logs,
+            "count": len(logs),
+        }
+
+    @app.get("/security/audit/recent")
+    async def get_recent_audit_logs(
+        limit: int = Query(default=100, ge=1, le=1000),
+        context=Depends(require_admin),
+    ):
+        """Get recent audit logs (admin only)."""
+        logs = await security_manager.query_audit_logs(limit=limit)
+        return {"logs": logs, "count": len(logs)}
+
+    # ==================== Rate Limiting ====================
+
+    @app.get("/security/rate-limit/status")
+    async def get_rate_limit_status(req: Request, context=Depends(require_auth)):
+        """Get current rate limit status."""
+        key = f"user:{context.user_id}"
+        status = await security_manager.get_rate_limit_status(key)
+        return status
+
+    # ==================== Security Stats ====================
+
+    @app.get("/security/stats")
+    async def get_security_stats(context=Depends(require_admin)):
+        """Get comprehensive security statistics (admin only)."""
+        return security_manager.get_stats()
+
+    logger.info("Security routes initialized")
