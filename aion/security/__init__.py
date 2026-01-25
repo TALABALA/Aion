@@ -1,14 +1,27 @@
 """
 AION Security & Access Control System
 
-Comprehensive security infrastructure for AION including:
-- Multi-method authentication (API key, JWT, OAuth2, session)
+Comprehensive SOTA security infrastructure for AION including:
+
+Core Security:
+- Multi-method authentication (API key, JWT, OAuth2, WebAuthn/FIDO2, mTLS)
 - Role-based and policy-based authorization (RBAC + ABAC)
 - Multi-tenant isolation with quotas
 - Comprehensive audit logging
-- Enterprise rate limiting
+- Enterprise rate limiting (including distributed Redis-backed)
 - Agent permission boundaries
-- Secure secret management
+- Secure secret management with external KMS integration
+
+Advanced Features:
+- WebAuthn/FIDO2 passwordless authentication
+- Device fingerprinting and risk scoring
+- ML-based anomaly detection
+- Zero Trust continuous verification
+- mTLS client certificate authentication
+- Post-quantum cryptography support
+- Secure enclave with auto-unsealing
+- Adaptive authentication with risk-based access control
+- Microsegmentation for Zero Trust architecture
 """
 
 from aion.security.types import (
@@ -115,6 +128,63 @@ from aion.security.middleware import (
     rate_limit,
 )
 
+# SOTA Feature Imports
+from aion.security.adaptive import (
+    DeviceFingerprint,
+    DeviceFingerprintManager,
+    RiskAssessment,
+    RiskEngine,
+    RiskLevel,
+    RiskScore,
+)
+
+from aion.security.adaptive.anomaly import (
+    AnomalyDetectionService,
+    AnomalyType,
+    AnomalySeverity,
+    EnsembleDetector,
+    IsolationForest,
+)
+
+from aion.security.zero_trust import (
+    ContinuousVerifier,
+    VerificationResult,
+    DeviceTrustEvaluator,
+    DeviceTrustScore,
+    ContextAwareAccessController,
+    AccessDecision,
+    SegmentationManager,
+)
+
+from aion.security.crypto import (
+    PQCProvider,
+    PQCAlgorithm,
+    HybridEncryption,
+    KyberKEM,
+    DilithiumSigner,
+)
+
+from aion.security.secrets.kms import (
+    KeyManagementService,
+    KMSProvider,
+    VaultBackend,
+    AWSKMSBackend,
+    AzureKeyVaultBackend,
+)
+
+from aion.security.secrets.enclave import (
+    SecureEnclave,
+    ShamirSecretSharing,
+    UnsealMethod,
+    SealStatus,
+)
+
+from aion.security.rate_limiting.distributed import (
+    DistributedRateLimiter,
+    DistributedRateLimitStrategy,
+    MultiTierRateLimiter,
+)
+
 __all__ = [
     # Manager
     "SecurityManager",
@@ -193,4 +263,46 @@ __all__ = [
     "authenticated",
     "authorized",
     "rate_limit",
+    # SOTA - Adaptive Security
+    "DeviceFingerprint",
+    "DeviceFingerprintManager",
+    "RiskAssessment",
+    "RiskEngine",
+    "RiskLevel",
+    "RiskScore",
+    # SOTA - Anomaly Detection
+    "AnomalyDetectionService",
+    "AnomalyType",
+    "AnomalySeverity",
+    "EnsembleDetector",
+    "IsolationForest",
+    # SOTA - Zero Trust
+    "ContinuousVerifier",
+    "VerificationResult",
+    "DeviceTrustEvaluator",
+    "DeviceTrustScore",
+    "ContextAwareAccessController",
+    "AccessDecision",
+    "SegmentationManager",
+    # SOTA - Post-Quantum Cryptography
+    "PQCProvider",
+    "PQCAlgorithm",
+    "HybridEncryption",
+    "KyberKEM",
+    "DilithiumSigner",
+    # SOTA - KMS Integration
+    "KeyManagementService",
+    "KMSProvider",
+    "VaultBackend",
+    "AWSKMSBackend",
+    "AzureKeyVaultBackend",
+    # SOTA - Secure Enclave
+    "SecureEnclave",
+    "ShamirSecretSharing",
+    "UnsealMethod",
+    "SealStatus",
+    # SOTA - Distributed Rate Limiting
+    "DistributedRateLimiter",
+    "DistributedRateLimitStrategy",
+    "MultiTierRateLimiter",
 ]
