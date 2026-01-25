@@ -49,6 +49,20 @@ try:
 except ImportError:
     MCP_AVAILABLE = False
 
+# Persistence layer imports (conditional to avoid import errors)
+try:
+    from aion.persistence import (
+        StateManager,
+        PersistenceConfig,
+        DatabaseBackend,
+        BackupManager,
+        TransactionManager,
+        MigrationRunner,
+    )
+    PERSISTENCE_AVAILABLE = True
+except ImportError:
+    PERSISTENCE_AVAILABLE = False
+
 # Goal system imports (conditional to avoid import errors)
 try:
     from aion.systems.goals import AutonomousGoalManager
@@ -144,6 +158,11 @@ class AIONKernel:
         # Goal system
         self._goal_manager = None
 
+        # Persistence layer
+        self._state_manager = None
+        self._backup_manager = None
+        self._transaction_manager = None
+
         # State
         self._status = SystemStatus.INITIALIZING
         self._health: dict[str, SystemHealth] = {}
@@ -207,6 +226,10 @@ class AIONKernel:
                     logger.warning("LLM initialization skipped", reason=str(e))
                     self._update_health("llm", SystemStatus.DEGRADED, str(e))
 
+                # Initialize persistence layer (before subsystems)
+                if PERSISTENCE_AVAILABLE:
+                    await self._initialize_persistence()
+
                 # Initialize subsystems
                 await self._initialize_subsystems()
 
@@ -221,6 +244,53 @@ class AIONKernel:
                 self._status = SystemStatus.ERROR
                 logger.error("Failed to initialize AION Kernel", error=str(e))
                 raise
+
+    async def _initialize_persistence(self) -> None:
+        """Initialize the persistence layer."""
+        try:
+            # Create persistence config
+            persistence_config = PersistenceConfig(
+                backend=DatabaseBackend.SQLITE,
+            )
+            persistence_config.sqlite.path = self.config.data_dir / "aion.db"
+
+            # Initialize state manager
+            self._state_manager = StateManager(persistence_config)
+            await self._state_manager.initialize()
+            self._update_health("persistence", SystemStatus.READY)
+
+            # Initialize backup manager
+            self._backup_manager = BackupManager(
+                connection=self._state_manager._db,
+                backup_dir=self.config.data_dir / "backups",
+            )
+            await self._backup_manager.initialize()
+            self._update_health("backup", SystemStatus.READY)
+
+            # Initialize transaction manager
+            self._transaction_manager = TransactionManager(
+                connection=self._state_manager._db,
+            )
+            await self._transaction_manager.initialize()
+
+            # Run migrations
+            migration_runner = MigrationRunner(connection=self._state_manager._db)
+            await migration_runner.initialize()
+            migration_result = await migration_runner.migrate()
+            if migration_result.applied:
+                logger.info(
+                    "Applied database migrations",
+                    count=len(migration_result.applied),
+                )
+
+            logger.info(
+                "Persistence layer initialized successfully",
+                backend=persistence_config.backend.value,
+            )
+
+        except Exception as e:
+            logger.error("Persistence layer initialization failed", error=str(e))
+            self._update_health("persistence", SystemStatus.ERROR, str(e))
 
     async def _initialize_subsystems(self) -> None:
         """Initialize all cognitive subsystems."""
@@ -680,6 +750,18 @@ class AIONKernel:
             await self._visual_cortex.shutdown()
         if self._audio_cortex:
             await self._audio_cortex.shutdown()
+
+        # Shutdown persistence layer (last)
+        if self._state_manager:
+            # Create backup on shutdown if configured
+            if self._backup_manager:
+                try:
+                    await self._backup_manager.create_backup(name="shutdown_backup")
+                    logger.info("Shutdown backup created")
+                except Exception as e:
+                    logger.warning("Failed to create shutdown backup", error=str(e))
+
+            await self._state_manager.shutdown()
 
         logger.info("AION Kernel shutdown complete")
 
@@ -1148,3 +1230,79 @@ Output a JSON array of steps, each with:
             "available": True,
             **self._goal_manager.get_stats(),
         }
+
+    # ==================== Persistence Layer Access ====================
+
+    @property
+    def state(self):
+        """Get the state manager for persistence operations."""
+        return self._state_manager
+
+    @property
+    def backup(self):
+        """Get the backup manager."""
+        return self._backup_manager
+
+    @property
+    def transactions(self):
+        """Get the transaction manager."""
+        return self._transaction_manager
+
+    async def create_backup(self, name: Optional[str] = None) -> Optional[str]:
+        """
+        Convenience method to create a backup.
+
+        Args:
+            name: Optional backup name
+
+        Returns:
+            Backup ID if successful, None otherwise
+        """
+        if not self._backup_manager:
+            return None
+
+        try:
+            metadata = await self._backup_manager.create_backup(name=name)
+            return metadata.id
+        except Exception as e:
+            logger.error("Backup creation failed", error=str(e))
+            return None
+
+    async def restore_backup(self, backup_id: str) -> bool:
+        """
+        Convenience method to restore from a backup.
+
+        Args:
+            backup_id: ID of backup to restore
+
+        Returns:
+            True if successful
+        """
+        if not self._backup_manager:
+            return False
+
+        try:
+            result = await self._backup_manager.restore(backup_id)
+            return result.success
+        except Exception as e:
+            logger.error("Backup restoration failed", error=str(e))
+            return False
+
+    def get_persistence_stats(self) -> dict[str, Any]:
+        """Get persistence layer statistics."""
+        if not self._state_manager:
+            return {"available": False}
+
+        stats = {
+            "available": True,
+            "initialized": self._state_manager._initialized,
+        }
+
+        if self._backup_manager:
+            try:
+                # Get backup stats synchronously if possible
+                stats["backups"] = {"available": True}
+            except Exception:
+                stats["backups"] = {"available": False}
+
+        return stats
