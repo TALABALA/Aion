@@ -2553,3 +2553,595 @@ def setup_knowledge_graph_routes(app: FastAPI, knowledge_manager) -> None:
         }
 
     logger.info("Knowledge graph routes initialized")
+
+
+# ==================== Observability Request/Response Models ====================
+
+class MetricQueryRequest(BaseModel):
+    """Request to query metrics."""
+    name: str = Field(..., description="Metric name")
+    labels: Optional[dict] = Field(default=None, description="Label filters")
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    limit: int = Field(default=1000, ge=1, le=10000)
+
+
+class TraceQueryRequest(BaseModel):
+    """Request to query traces."""
+    service_name: Optional[str] = None
+    operation_name: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    min_duration_ms: Optional[float] = None
+    max_duration_ms: Optional[float] = None
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+class LogQueryRequest(BaseModel):
+    """Request to query logs."""
+    level: Optional[str] = None
+    logger_name: Optional[str] = None
+    message_contains: Optional[str] = None
+    trace_id: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    limit: int = Field(default=1000, ge=1, le=10000)
+
+
+class AlertRuleCreateRequest(BaseModel):
+    """Request to create an alert rule."""
+    name: str = Field(..., description="Rule name")
+    description: str = Field(default="", description="Rule description")
+    metric_name: str = Field(..., description="Metric to monitor")
+    condition: str = Field(..., description="Condition: gt, lt, gte, lte, eq, neq")
+    threshold: float = Field(..., description="Threshold value")
+    duration_seconds: float = Field(default=60, description="Duration threshold must be met")
+    severity: str = Field(default="warning", description="Alert severity")
+    labels: dict = Field(default_factory=dict)
+    annotations: dict = Field(default_factory=dict)
+    channels: list[str] = Field(default_factory=list)
+
+
+class CostBudgetRequest(BaseModel):
+    """Request to create/update a cost budget."""
+    name: str = Field(..., description="Budget name")
+    daily_limit: Optional[float] = None
+    monthly_limit: Optional[float] = None
+    alert_threshold: float = Field(default=0.8, ge=0, le=1)
+    resource_types: list[str] = Field(default_factory=list)
+
+
+class HealthCheckRequest(BaseModel):
+    """Request to register a health check."""
+    name: str = Field(..., description="Check name")
+    check_type: str = Field(default="custom", description="Check type")
+    critical: bool = Field(default=False)
+    timeout_seconds: float = Field(default=5.0)
+
+
+def setup_observability_routes(app: FastAPI, observability_manager) -> None:
+    """Setup routes for the Observability system."""
+
+    # ==================== System Stats ====================
+
+    @app.get("/observability/stats")
+    async def get_observability_stats():
+        """Get overall observability system statistics."""
+        return observability_manager.get_stats()
+
+    @app.get("/observability/uptime")
+    async def get_uptime():
+        """Get system uptime."""
+        return {
+            "uptime_seconds": observability_manager.uptime_seconds,
+            "initialized": observability_manager._initialized,
+        }
+
+    # ==================== Metrics ====================
+
+    @app.get("/observability/metrics")
+    async def get_prometheus_metrics():
+        """Get metrics in Prometheus exposition format."""
+        from fastapi.responses import PlainTextResponse
+        if observability_manager.metrics:
+            output = observability_manager.metrics.export_prometheus()
+            return PlainTextResponse(
+                content=output,
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+        return PlainTextResponse(content="", media_type="text/plain")
+
+    @app.get("/observability/metrics/json")
+    async def get_metrics_json():
+        """Get all current metrics as JSON."""
+        if observability_manager.metrics:
+            return observability_manager.metrics.get_stats()
+        return {"metrics": []}
+
+    @app.post("/observability/metrics/query")
+    async def query_metrics(request: MetricQueryRequest):
+        """Query metric time series data."""
+        if not observability_manager.metrics:
+            raise HTTPException(status_code=503, detail="Metrics engine not initialized")
+
+        values = observability_manager.metrics.query(
+            name=request.name,
+            labels=request.labels or {},
+            start_time=request.start_time,
+            end_time=request.end_time,
+            limit=request.limit,
+        )
+        return {
+            "metric": request.name,
+            "labels": request.labels,
+            "values": values,
+            "count": len(values),
+        }
+
+    @app.get("/observability/metrics/names")
+    async def list_metric_names():
+        """List all registered metric names."""
+        if observability_manager.metrics:
+            return {"names": list(observability_manager.metrics._definitions.keys())}
+        return {"names": []}
+
+    @app.get("/observability/metrics/{name}/latest")
+    async def get_latest_metric(name: str, labels: Optional[str] = Query(default=None)):
+        """Get latest value for a specific metric."""
+        if not observability_manager.metrics:
+            raise HTTPException(status_code=503, detail="Metrics engine not initialized")
+
+        label_dict = {}
+        if labels:
+            for pair in labels.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    label_dict[k] = v
+
+        value = observability_manager.metrics.get_current(name, label_dict)
+        return {
+            "metric": name,
+            "labels": label_dict,
+            "value": value,
+        }
+
+    # ==================== Tracing ====================
+
+    @app.get("/observability/traces")
+    async def list_traces(
+        service_name: Optional[str] = Query(default=None),
+        operation_name: Optional[str] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        """List recent traces."""
+        if not observability_manager.tracing:
+            raise HTTPException(status_code=503, detail="Tracing engine not initialized")
+
+        traces = list(observability_manager.tracing._traces.values())[-limit:]
+        return {
+            "traces": [
+                {
+                    "trace_id": t.trace_id,
+                    "root_span": t.root_span.operation_name if t.root_span else None,
+                    "service": t.root_span.service_name if t.root_span else None,
+                    "span_count": t.span_count,
+                    "duration_ms": t.duration_ms,
+                    "start_time": t.start_time.isoformat() if t.start_time else None,
+                    "end_time": t.end_time.isoformat() if t.end_time else None,
+                }
+                for t in traces
+            ],
+            "count": len(traces),
+        }
+
+    @app.get("/observability/traces/{trace_id}")
+    async def get_trace(trace_id: str):
+        """Get a specific trace by ID."""
+        if not observability_manager.tracing:
+            raise HTTPException(status_code=503, detail="Tracing engine not initialized")
+
+        trace = observability_manager.tracing._traces.get(trace_id)
+        if not trace:
+            raise HTTPException(status_code=404, detail=f"Trace {trace_id} not found")
+
+        return {
+            "trace_id": trace.trace_id,
+            "spans": [s.to_dict() for s in trace.spans],
+            "span_count": trace.span_count,
+            "duration_ms": trace.duration_ms,
+            "has_errors": trace.has_errors,
+            "start_time": trace.start_time.isoformat() if trace.start_time else None,
+            "end_time": trace.end_time.isoformat() if trace.end_time else None,
+        }
+
+    @app.get("/observability/traces/{trace_id}/spans/{span_id}")
+    async def get_span(trace_id: str, span_id: str):
+        """Get a specific span."""
+        if not observability_manager.tracing:
+            raise HTTPException(status_code=503, detail="Tracing engine not initialized")
+
+        trace = observability_manager.tracing._traces.get(trace_id)
+        if not trace:
+            raise HTTPException(status_code=404, detail=f"Trace {trace_id} not found")
+
+        for span in trace.spans:
+            if span.span_id == span_id:
+                return span.to_dict()
+
+        raise HTTPException(status_code=404, detail=f"Span {span_id} not found")
+
+    @app.get("/observability/tracing/stats")
+    async def get_tracing_stats():
+        """Get tracing engine statistics."""
+        if observability_manager.tracing:
+            return observability_manager.tracing.get_stats()
+        return {}
+
+    # ==================== Logs ====================
+
+    @app.post("/observability/logs/query")
+    async def query_logs(request: LogQueryRequest):
+        """Query logs with filters."""
+        if not observability_manager.logging:
+            raise HTTPException(status_code=503, detail="Logging engine not initialized")
+
+        logs = observability_manager.logging.query_logs(
+            level=request.level,
+            logger_name=request.logger_name,
+            message_contains=request.message_contains,
+            trace_id=request.trace_id,
+            limit=request.limit,
+        )
+        return {
+            "logs": [log.to_dict() for log in logs],
+            "count": len(logs),
+        }
+
+    @app.get("/observability/logs/recent")
+    async def get_recent_logs(
+        limit: int = Query(default=100, ge=1, le=1000),
+        level: Optional[str] = Query(default=None),
+    ):
+        """Get recent log entries."""
+        if not observability_manager.logging:
+            raise HTTPException(status_code=503, detail="Logging engine not initialized")
+
+        logs = observability_manager.logging.query_logs(
+            level=level,
+            limit=limit,
+        )
+        return {
+            "logs": [log.to_dict() for log in logs],
+            "count": len(logs),
+        }
+
+    @app.get("/observability/logs/trace/{trace_id}")
+    async def get_logs_by_trace(trace_id: str):
+        """Get all logs associated with a trace."""
+        if not observability_manager.logging:
+            raise HTTPException(status_code=503, detail="Logging engine not initialized")
+
+        logs = observability_manager.logging.query_logs(trace_id=trace_id)
+        return {
+            "trace_id": trace_id,
+            "logs": [log.to_dict() for log in logs],
+            "count": len(logs),
+        }
+
+    # ==================== Alerts ====================
+
+    @app.get("/observability/alerts")
+    async def list_alerts(
+        state: Optional[str] = Query(default=None, description="Filter by state: firing, pending, inactive, resolved"),
+        severity: Optional[str] = Query(default=None),
+    ):
+        """List alerts."""
+        if not observability_manager.alerts:
+            raise HTTPException(status_code=503, detail="Alert engine not initialized")
+
+        alerts = observability_manager.alerts.get_active_alerts()
+
+        if state:
+            alerts = [a for a in alerts if a.state.value == state]
+        if severity:
+            alerts = [a for a in alerts if a.severity.value == severity]
+
+        return {
+            "alerts": [a.to_dict() for a in alerts],
+            "count": len(alerts),
+        }
+
+    @app.get("/observability/alerts/rules")
+    async def list_alert_rules():
+        """List all alert rules."""
+        if not observability_manager.alerts:
+            raise HTTPException(status_code=503, detail="Alert engine not initialized")
+
+        rules = list(observability_manager.alerts._rules.values())
+        return {
+            "rules": [r.to_dict() for r in rules],
+            "count": len(rules),
+        }
+
+    @app.post("/observability/alerts/rules")
+    async def create_alert_rule(request: AlertRuleCreateRequest):
+        """Create a new alert rule."""
+        if not observability_manager.alerts:
+            raise HTTPException(status_code=503, detail="Alert engine not initialized")
+
+        from aion.observability.types import AlertRule, AlertSeverity
+
+        severity = AlertSeverity(request.severity) if request.severity else AlertSeverity.WARNING
+
+        rule = AlertRule(
+            name=request.name,
+            description=request.description,
+            metric_name=request.metric_name,
+            condition=request.condition,
+            threshold=request.threshold,
+            duration_seconds=request.duration_seconds,
+            severity=severity,
+            labels=request.labels,
+            annotations=request.annotations,
+            channels=request.channels,
+        )
+
+        observability_manager.alerts.add_rule(rule)
+        return {"status": "created", "rule": rule.to_dict()}
+
+    @app.delete("/observability/alerts/rules/{rule_name}")
+    async def delete_alert_rule(rule_name: str):
+        """Delete an alert rule."""
+        if not observability_manager.alerts:
+            raise HTTPException(status_code=503, detail="Alert engine not initialized")
+
+        if rule_name in observability_manager.alerts._rules:
+            del observability_manager.alerts._rules[rule_name]
+            return {"status": "deleted", "rule_name": rule_name}
+
+        raise HTTPException(status_code=404, detail=f"Rule {rule_name} not found")
+
+    @app.post("/observability/alerts/silence")
+    async def silence_alert(
+        rule_name: str = Body(...),
+        duration_seconds: int = Body(default=3600),
+        reason: Optional[str] = Body(default=None),
+    ):
+        """Silence an alert rule."""
+        if not observability_manager.alerts:
+            raise HTTPException(status_code=503, detail="Alert engine not initialized")
+
+        observability_manager.alerts.silence_rule(rule_name, duration_seconds, reason)
+        return {
+            "status": "silenced",
+            "rule_name": rule_name,
+            "duration_seconds": duration_seconds,
+        }
+
+    @app.get("/observability/alerts/stats")
+    async def get_alert_stats():
+        """Get alert engine statistics."""
+        if observability_manager.alerts:
+            return observability_manager.alerts.get_stats()
+        return {}
+
+    # ==================== Cost Tracking ====================
+
+    @app.get("/observability/costs")
+    async def get_cost_summary():
+        """Get cost tracking summary."""
+        if not observability_manager.costs:
+            raise HTTPException(status_code=503, detail="Cost tracker not initialized")
+
+        return observability_manager.costs.get_stats()
+
+    @app.get("/observability/costs/daily")
+    async def get_daily_costs(
+        date: Optional[str] = Query(default=None, description="Date in YYYY-MM-DD format"),
+    ):
+        """Get daily cost breakdown."""
+        if not observability_manager.costs:
+            raise HTTPException(status_code=503, detail="Cost tracker not initialized")
+
+        target_date = None
+        if date:
+            target_date = datetime.fromisoformat(date).date()
+
+        costs = observability_manager.costs.get_daily_costs(target_date)
+        return costs
+
+    @app.get("/observability/costs/by-model")
+    async def get_costs_by_model():
+        """Get costs grouped by model."""
+        if not observability_manager.costs:
+            raise HTTPException(status_code=503, detail="Cost tracker not initialized")
+
+        return observability_manager.costs.get_costs_by_model()
+
+    @app.get("/observability/costs/by-agent")
+    async def get_costs_by_agent():
+        """Get costs grouped by agent."""
+        if not observability_manager.costs:
+            raise HTTPException(status_code=503, detail="Cost tracker not initialized")
+
+        return observability_manager.costs.get_costs_by_agent()
+
+    @app.post("/observability/costs/budgets")
+    async def create_budget(request: CostBudgetRequest):
+        """Create a cost budget."""
+        if not observability_manager.costs:
+            raise HTTPException(status_code=503, detail="Cost tracker not initialized")
+
+        from aion.observability.types import CostBudget, ResourceType
+
+        budget = CostBudget(
+            name=request.name,
+            daily_limit=request.daily_limit,
+            monthly_limit=request.monthly_limit,
+            alert_threshold=request.alert_threshold,
+            resource_types=[ResourceType(rt) for rt in request.resource_types] if request.resource_types else None,
+        )
+
+        observability_manager.costs.set_budget(budget)
+        return {"status": "created", "budget": budget.to_dict()}
+
+    @app.get("/observability/costs/budgets")
+    async def list_budgets():
+        """List all cost budgets."""
+        if not observability_manager.costs:
+            raise HTTPException(status_code=503, detail="Cost tracker not initialized")
+
+        return {"budgets": observability_manager.costs.get_budgets()}
+
+    # ==================== Anomaly Detection ====================
+
+    @app.get("/observability/anomalies")
+    async def list_anomalies(
+        limit: int = Query(default=100, ge=1, le=1000),
+        severity: Optional[str] = Query(default=None),
+    ):
+        """List detected anomalies."""
+        if not observability_manager.anomaly:
+            raise HTTPException(status_code=503, detail="Anomaly detector not initialized")
+
+        anomalies = observability_manager.anomaly.get_recent_anomalies(limit)
+
+        if severity:
+            anomalies = [a for a in anomalies if a.severity.value == severity]
+
+        return {
+            "anomalies": [a.to_dict() for a in anomalies],
+            "count": len(anomalies),
+        }
+
+    @app.get("/observability/anomalies/stats")
+    async def get_anomaly_stats():
+        """Get anomaly detection statistics."""
+        if observability_manager.anomaly:
+            return observability_manager.anomaly.get_stats()
+        return {}
+
+    @app.get("/observability/anomalies/metric/{metric_name}")
+    async def get_metric_anomaly_status(metric_name: str):
+        """Get anomaly status for a specific metric."""
+        if not observability_manager.anomaly:
+            raise HTTPException(status_code=503, detail="Anomaly detector not initialized")
+
+        status = observability_manager.anomaly.get_metric_status(metric_name)
+        return status
+
+    # ==================== Profiling ====================
+
+    @app.get("/observability/profiling/operations")
+    async def list_profiled_operations():
+        """List profiled operations."""
+        if not observability_manager.profiler:
+            raise HTTPException(status_code=503, detail="Profiler not initialized")
+
+        operations = observability_manager.profiler.get_operations()
+        return {
+            "operations": [op.to_dict() for op in operations],
+            "count": len(operations),
+        }
+
+    @app.get("/observability/profiling/hotspots")
+    async def get_hot_spots(
+        limit: int = Query(default=10, ge=1, le=100),
+    ):
+        """Get performance hot spots."""
+        if not observability_manager.profiler:
+            raise HTTPException(status_code=503, detail="Profiler not initialized")
+
+        hotspots = observability_manager.profiler.get_hot_spots(limit)
+        return {
+            "hotspots": [hs.to_dict() for hs in hotspots],
+            "count": len(hotspots),
+        }
+
+    @app.get("/observability/profiling/stats")
+    async def get_profiler_stats():
+        """Get profiler statistics."""
+        if observability_manager.profiler:
+            return observability_manager.profiler.get_stats()
+        return {}
+
+    @app.get("/observability/profiling/memory")
+    async def get_memory_profile():
+        """Get memory usage profile."""
+        if not observability_manager.profiler:
+            raise HTTPException(status_code=503, detail="Profiler not initialized")
+
+        return observability_manager.profiler.get_memory_stats()
+
+    # ==================== Health Checks ====================
+
+    @app.get("/observability/health")
+    async def get_health_status():
+        """Get overall health status."""
+        if not observability_manager.health:
+            raise HTTPException(status_code=503, detail="Health checker not initialized")
+
+        health = await observability_manager.health.check_all()
+        return health.to_dict()
+
+    @app.get("/observability/health/ready")
+    async def readiness_probe():
+        """Kubernetes readiness probe."""
+        if not observability_manager.health:
+            return {"ready": True}
+
+        is_ready = await observability_manager.health.is_ready()
+        if not is_ready:
+            raise HTTPException(status_code=503, detail="Not ready")
+        return {"ready": True}
+
+    @app.get("/observability/health/live")
+    async def liveness_probe():
+        """Kubernetes liveness probe."""
+        if not observability_manager.health:
+            return {"alive": True}
+
+        is_alive = await observability_manager.health.is_alive()
+        if not is_alive:
+            raise HTTPException(status_code=503, detail="Not alive")
+        return {"alive": True}
+
+    @app.get("/observability/health/checks")
+    async def list_health_checks():
+        """List all registered health checks."""
+        if not observability_manager.health:
+            return {"checks": []}
+
+        return observability_manager.health.get_stats()
+
+    @app.get("/observability/health/{check_name}")
+    async def get_health_check(check_name: str):
+        """Get status of a specific health check."""
+        if not observability_manager.health:
+            raise HTTPException(status_code=503, detail="Health checker not initialized")
+
+        result = await observability_manager.health.run_check(check_name)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"Health check {check_name} not found")
+
+        return result.to_dict()
+
+    # ==================== Collector Stats ====================
+
+    @app.get("/observability/collector/stats")
+    async def get_collector_stats():
+        """Get telemetry collector statistics."""
+        if observability_manager.collector:
+            return observability_manager.collector.get_stats()
+        return {}
+
+    @app.post("/observability/collector/flush")
+    async def flush_collector():
+        """Force flush the telemetry collector."""
+        if not observability_manager.collector:
+            raise HTTPException(status_code=503, detail="Collector not initialized")
+
+        await observability_manager.collector.flush()
+        return {"status": "flushed"}
+
+    logger.info("Observability routes initialized")
