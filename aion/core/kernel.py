@@ -56,6 +56,14 @@ try:
 except ImportError:
     GOAL_SYSTEM_AVAILABLE = False
 
+# Automation system imports (conditional to avoid import errors)
+try:
+    from aion.automation.engine import WorkflowEngine
+    from aion.automation.triggers.manager import TriggerManager
+    AUTOMATION_AVAILABLE = True
+except ImportError:
+    AUTOMATION_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -143,6 +151,10 @@ class AIONKernel:
 
         # Goal system
         self._goal_manager = None
+
+        # Automation system
+        self._automation_engine = None
+        self._trigger_manager = None
 
         # State
         self._status = SystemStatus.INITIALIZING
@@ -309,6 +321,10 @@ class AIONKernel:
         if GOAL_SYSTEM_AVAILABLE:
             await self._initialize_goal_system()
 
+        # Initialize Automation System
+        if AUTOMATION_AVAILABLE:
+            await self._initialize_automation()
+
     async def _initialize_conversation(self) -> None:
         """Initialize the Conversation System."""
         try:
@@ -393,6 +409,35 @@ class AIONKernel:
         except Exception as e:
             logger.error(f"Goal system initialization failed: {e}")
             self._update_health("goals", SystemStatus.ERROR, str(e))
+
+    async def _initialize_automation(self) -> None:
+        """Initialize the Workflow Automation System."""
+        try:
+            from aion.automation.engine import WorkflowEngine
+            from aion.automation.triggers.manager import TriggerManager
+
+            # Create trigger manager
+            self._trigger_manager = TriggerManager()
+
+            # Create workflow engine
+            self._automation_engine = WorkflowEngine(
+                trigger_manager=self._trigger_manager,
+            )
+
+            # Connect to event bus if available
+            if self._event_bus:
+                self._automation_engine.set_event_bus(self._event_bus)
+
+            await self._automation_engine.initialize()
+            self._update_health("automation", SystemStatus.READY)
+            logger.info("Automation system initialized successfully")
+
+        except ImportError as e:
+            logger.warning(f"Automation system not available: {e}")
+            self._update_health("automation", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"Automation system initialization failed: {e}")
+            self._update_health("automation", SystemStatus.ERROR, str(e))
 
     async def _initialize_mcp(self) -> None:
         """Initialize the MCP Integration Layer."""
@@ -664,6 +709,12 @@ class AIONKernel:
         # Shutdown goal system
         if self._goal_manager:
             await self._goal_manager.shutdown()
+
+        # Shutdown automation system
+        if self._automation_engine:
+            await self._automation_engine.shutdown()
+        if self._trigger_manager:
+            await self._trigger_manager.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -1147,4 +1198,26 @@ Output a JSON array of steps, each with:
         return {
             "available": True,
             **self._goal_manager.get_stats(),
+        }
+
+    # ==================== Automation System Access ====================
+
+    @property
+    def automation(self):
+        """Get the workflow automation engine."""
+        return self._automation_engine
+
+    @property
+    def triggers(self):
+        """Get the trigger manager."""
+        return self._trigger_manager
+
+    def get_automation_stats(self) -> dict[str, Any]:
+        """Get automation system statistics."""
+        if not self._automation_engine:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._automation_engine.get_stats(),
         }
