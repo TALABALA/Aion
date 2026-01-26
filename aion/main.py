@@ -29,6 +29,13 @@ from aion.api.routes import (
     setup_audio_routes,
 )
 
+# Automation system routes (conditional import)
+try:
+    from aion.automation.api import setup_automation_routes
+    AUTOMATION_ROUTES_AVAILABLE = True
+except ImportError:
+    AUTOMATION_ROUTES_AVAILABLE = False
+
 
 # Configure structured logging
 def setup_logging(log_level: str = "INFO") -> None:
@@ -91,6 +98,9 @@ async def lifespan(app: FastAPI):
 
     if kernel.audio:
         setup_audio_routes(app, kernel.audio)
+
+    if AUTOMATION_ROUTES_AVAILABLE and kernel.automation:
+        setup_automation_routes(app, kernel.automation)
 
     logger.info("AION system ready", status=kernel.get_status())
 
