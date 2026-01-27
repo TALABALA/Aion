@@ -5,6 +5,7 @@ from .signals import SignalProcessor, SignalRegistry
 from .explicit import ExplicitFeedbackProcessor
 from .implicit import ImplicitSignalExtractor
 from .shaping import RewardShaper, PotentialBasedShaping
+from .rnd import RNDCuriosityShaper
 
 __all__ = [
     "RewardCollector",
@@ -14,4 +15,5 @@ __all__ = [
     "ImplicitSignalExtractor",
     "RewardShaper",
     "PotentialBasedShaping",
+    "RNDCuriosityShaper",
 ]

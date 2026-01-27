@@ -861,3 +861,338 @@ class TestEndToEndLearningLoop:
         assert len(bandit_stats) > 0
 
         await rl.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# SOTA Components: MLP, TargetNetwork, StateValueFunction, RND
+# ---------------------------------------------------------------------------
+from aion.learning.nn import MLP
+from aion.learning.policies.value_function import (
+    TargetNetwork,
+    StateValueFunction,
+)
+from aion.learning.config import ValueFunctionConfig, RNDConfig
+from aion.learning.rewards.rnd import RNDCuriosityShaper
+
+
+class TestMLP:
+    def test_forward_single(self):
+        mlp = MLP(4, 8, 1)
+        x = np.array([1.0, 2.0, 3.0, 4.0])
+        out = mlp.forward(x)
+        assert out.shape == (1, 1)
+
+    def test_forward_batch(self):
+        mlp = MLP(4, 8, 2)
+        x = np.random.randn(5, 4)
+        out = mlp.forward(x)
+        assert out.shape == (5, 2)
+
+    def test_backward_and_apply(self):
+        mlp = MLP(3, 6, 1)
+        x = np.random.randn(4, 3)
+        out = mlp.forward(x)
+        d_out = np.ones_like(out)
+        grads = mlp.backward(d_out, clip=1.0)
+        assert set(grads.keys()) == {"W1", "b1", "W2", "b2"}
+        assert grads["W1"].shape == mlp.W1.shape
+        assert grads["b1"].shape == mlp.b1.shape
+        assert grads["W2"].shape == mlp.W2.shape
+        assert grads["b2"].shape == mlp.b2.shape
+        mlp.apply_gradients(grads, lr=0.01)
+
+    def test_gradient_clipping(self):
+        mlp = MLP(3, 6, 1)
+        x = np.random.randn(1, 3) * 100
+        mlp.forward(x)
+        d_out = np.array([[1000.0]])
+        grads = mlp.backward(d_out, clip=0.5)
+        total_norm = np.sqrt(sum(np.sum(g ** 2) for g in grads.values()))
+        assert total_norm <= 0.5 + 1e-6
+
+    def test_copy(self):
+        mlp = MLP(3, 6, 1)
+        clone = mlp.copy()
+        np.testing.assert_array_equal(clone.W1, mlp.W1)
+        np.testing.assert_array_equal(clone.b1, mlp.b1)
+        clone.W1[0, 0] = 999.0
+        assert mlp.W1[0, 0] != 999.0
+
+    def test_get_set_params(self):
+        mlp = MLP(3, 6, 1)
+        params = mlp.get_params()
+        mlp2 = MLP(3, 6, 1)
+        mlp2.set_params(params)
+        np.testing.assert_array_equal(mlp2.W1, mlp.W1)
+
+    def test_learning_reduces_loss(self):
+        """Train MLP to fit y = mean(x) and verify loss decreases."""
+        np.random.seed(42)
+        mlp = MLP(3, 16, 1)
+        X = np.random.randn(32, 3)
+        y = X.mean(axis=1, keepdims=True)
+
+        losses = []
+        for _ in range(50):
+            out = mlp.forward(X)
+            loss = float(np.mean((out - y) ** 2))
+            losses.append(loss)
+            d_out = 2 * (out - y) / len(X)
+            grads = mlp.backward(d_out, clip=5.0)
+            mlp.apply_gradients(grads, lr=0.01)
+
+        assert losses[-1] < losses[0]
+
+
+class TestTargetNetwork:
+    def test_soft_update(self):
+        source = MLP(3, 6, 1)
+        target = TargetNetwork(source, tau=0.5)
+        src_params = source.get_params()
+        tgt_params = target.get_params()
+        np.testing.assert_array_almost_equal(src_params["W1"], tgt_params["W1"])
+
+        source.W1 += 10.0
+        target.soft_update(source)
+        tgt_params_after = target.get_params()
+        expected_W1 = 0.5 * source.W1 + 0.5 * src_params["W1"]
+        np.testing.assert_array_almost_equal(tgt_params_after["W1"], expected_W1)
+
+    def test_hard_update(self):
+        source = MLP(3, 6, 1)
+        target = TargetNetwork(source, tau=0.01)
+        source.W1 += 100.0
+        target.hard_update(source)
+        np.testing.assert_array_equal(target.get_params()["W1"], source.W1)
+
+    def test_forward(self):
+        source = MLP(3, 6, 1)
+        target = TargetNetwork(source, tau=0.01)
+        x = np.array([1.0, 2.0, 3.0])
+        out = target.forward(x)
+        assert out.shape == (1, 1)
+
+
+class TestStateValueFunction:
+    def test_predict(self):
+        vf = StateValueFunction(feature_dim=5)
+        features = np.random.randn(5)
+        v = vf.predict(features)
+        assert isinstance(v, float)
+
+    def test_predict_batch(self):
+        vf = StateValueFunction(feature_dim=5)
+        features = np.random.randn(10, 5)
+        values = vf.predict_batch(features)
+        assert values.shape == (10,)
+
+    def test_predict_target(self):
+        vf = StateValueFunction(feature_dim=5)
+        features = np.random.randn(5)
+        v = vf.predict_target(features)
+        assert isinstance(v, float)
+
+    def test_update_returns_metrics(self):
+        vf = StateValueFunction(feature_dim=4)
+        states = np.random.randn(8, 4)
+        rewards = np.random.randn(8)
+        next_states = np.random.randn(8, 4)
+        dones = np.zeros(8)
+        metrics = vf.update(states, rewards, next_states, dones)
+        assert "value_loss" in metrics
+        assert "mean_value" in metrics
+        assert "td_errors" in metrics
+        assert len(metrics["td_errors"]) == 8
+
+    def test_update_with_importance_weights(self):
+        vf = StateValueFunction(feature_dim=4)
+        states = np.random.randn(8, 4)
+        rewards = np.random.randn(8)
+        next_states = np.random.randn(8, 4)
+        dones = np.zeros(8)
+        weights = np.ones(8) * 0.5
+        metrics = vf.update(states, rewards, next_states, dones, importance_weights=weights)
+        assert "value_loss" in metrics
+
+    def test_td_learning_improves_predictions(self):
+        """Verify TD(0) updates move V(s) toward the observed returns."""
+        np.random.seed(42)
+        vf = StateValueFunction(
+            feature_dim=3,
+            config=ValueFunctionConfig(learning_rate=0.01, hidden_dim=16),
+        )
+        state = np.array([1.0, 0.5, 0.2])
+        for _ in range(100):
+            vf.update(
+                states=state.reshape(1, -1),
+                rewards=np.array([1.0]),
+                next_states=state.reshape(1, -1),
+                dones=np.array([1.0]),
+            )
+        v = vf.predict(state)
+        assert abs(v - 1.0) < 0.5
+
+    def test_compute_gae_empty(self):
+        vf = StateValueFunction(feature_dim=3)
+        adv, targets = vf.compute_gae([], [], [], [])
+        assert len(adv) == 0
+        assert len(targets) == 0
+
+    def test_compute_gae_single_step(self):
+        vf = StateValueFunction(feature_dim=3)
+        s = [np.array([1.0, 0.5, 0.2])]
+        ns = [np.array([0.5, 0.3, 0.1])]
+        adv, targets = vf.compute_gae(s, [1.0], ns, [False])
+        assert len(adv) == 1
+        assert len(targets) == 1
+
+    def test_compute_gae_multi_step(self):
+        np.random.seed(42)
+        vf = StateValueFunction(
+            feature_dim=3,
+            config=ValueFunctionConfig(gamma=0.99, gae_lambda=0.95),
+        )
+        T = 5
+        states = [np.random.randn(3) for _ in range(T)]
+        next_states = states[1:] + [np.random.randn(3)]
+        rewards = [1.0, 0.5, 0.0, -0.5, 1.0]
+        dones = [False, False, False, False, True]
+
+        adv, targets = vf.compute_gae(states, rewards, next_states, dones)
+        assert adv.shape == (5,)
+        assert targets.shape == (5,)
+        values = vf.predict_batch(np.array(states))
+        np.testing.assert_array_almost_equal(targets, adv + values)
+
+    def test_get_stats(self):
+        vf = StateValueFunction(feature_dim=5)
+        stats = vf.get_stats()
+        assert stats["initialized"] is False
+        vf.predict(np.random.randn(5))
+        stats = vf.get_stats()
+        assert stats["initialized"] is True
+        assert stats["feature_dim"] == 5
+
+    def test_get_set_params(self):
+        vf = StateValueFunction(feature_dim=3)
+        vf.predict(np.random.randn(3))
+        params = vf.get_params()
+        assert params is not None
+        vf2 = StateValueFunction(feature_dim=3)
+        vf2.predict(np.random.randn(3))
+        vf2.set_params(params)
+        x = np.random.randn(3)
+        assert vf.predict(x) == vf2.predict(x)
+
+
+class TestRNDCuriosityShaper:
+    def test_intrinsic_reward(self):
+        rnd = RNDCuriosityShaper(RNDConfig(normalise_intrinsic=False))
+        features = np.random.randn(5)
+        reward = rnd.compute_intrinsic_reward(features)
+        assert isinstance(reward, float)
+        assert reward >= 0.0
+
+    def test_intrinsic_batch(self):
+        rnd = RNDCuriosityShaper(RNDConfig(normalise_intrinsic=False))
+        features = np.random.randn(10, 5)
+        rewards = rnd.compute_intrinsic_batch(features)
+        assert rewards.shape == (10,)
+
+    def test_train_predictor_reduces_error(self):
+        """Training the predictor should reduce prediction error on the same data."""
+        np.random.seed(42)
+        rnd = RNDCuriosityShaper(RNDConfig(
+            normalise_intrinsic=False,
+            learning_rate=0.01,
+            hidden_dim=32,
+        ))
+        features = np.random.randn(16, 5)
+
+        initial_loss = rnd.train_predictor(features)["rnd_loss"]
+        for _ in range(50):
+            rnd.train_predictor(features)
+        final_loss = rnd.train_predictor(features)["rnd_loss"]
+        assert final_loss < initial_loss
+
+    def test_novel_states_have_higher_reward(self):
+        """States never seen during training should have higher intrinsic reward."""
+        np.random.seed(42)
+        rnd = RNDCuriosityShaper(RNDConfig(
+            normalise_intrinsic=False,
+            learning_rate=0.01,
+        ))
+        familiar = np.random.randn(20, 5)
+        novel = np.random.randn(5) + 10.0
+
+        for _ in range(100):
+            rnd.train_predictor(familiar)
+
+        familiar_reward = rnd.compute_intrinsic_reward(familiar[0])
+        novel_reward = rnd.compute_intrinsic_reward(novel)
+        assert novel_reward > familiar_reward
+
+    def test_shape_interface(self):
+        """RNDCuriosityShaper implements the RewardShaper interface."""
+        rnd = RNDCuriosityShaper()
+        state = StateRepresentation(query_complexity=0.5, turn_count=1)
+        shaped = rnd.shape(state, state, raw_reward=1.0)
+        assert isinstance(shaped, float)
+        assert shaped >= 1.0
+
+    def test_normalisation(self):
+        """With normalisation, intrinsic rewards should not explode."""
+        rnd = RNDCuriosityShaper(RNDConfig(normalise_intrinsic=True))
+        rewards = []
+        for _ in range(100):
+            features = np.random.randn(5) * 10
+            r = rnd.compute_intrinsic_reward(features)
+            rewards.append(r)
+        assert np.std(rewards) < 10.0
+
+    def test_get_stats(self):
+        rnd = RNDCuriosityShaper()
+        stats = rnd.get_stats()
+        assert "initialized" in stats
+        assert stats["initialized"] is False
+        rnd.compute_intrinsic_reward(np.random.randn(5))
+        stats = rnd.get_stats()
+        assert stats["initialized"] is True
+
+
+class TestActorCriticIntegration:
+    """Test the full actor-critic pipeline through the PolicyOptimizer."""
+
+    @pytest.mark.asyncio
+    async def test_optimizer_has_value_function_and_rnd(self):
+        kernel = MagicMock()
+        buf = ExperienceBuffer(BufferConfig(min_size_for_sampling=1))
+        opt = PolicyOptimizer(kernel, buf)
+        assert hasattr(opt, "value_function")
+        assert hasattr(opt, "rnd")
+        assert isinstance(opt.value_function, StateValueFunction)
+        assert isinstance(opt.rnd, RNDCuriosityShaper)
+
+    @pytest.mark.asyncio
+    async def test_optimizer_stats_include_critic_and_rnd(self):
+        kernel = MagicMock()
+        buf = ExperienceBuffer(BufferConfig(min_size_for_sampling=1))
+        opt = PolicyOptimizer(kernel, buf)
+        stats = opt.get_stats()
+        assert "value_function" in stats
+        assert "rnd" in stats
+        assert "total_critic_loss" in stats
+        assert "total_rnd_loss" in stats
+
+    @pytest.mark.asyncio
+    async def test_advantage_based_policy_update(self):
+        """Verify policies accept and use advantage parameter."""
+        policy = ToolSelectionPolicy(PolicyConfig(name="test", learning_rate=0.1))
+        exp = Experience(
+            state=StateRepresentation(query_complexity=0.5),
+            action=Action(choice="tool_a"),
+            cumulative_reward=1.0,
+        )
+        advantages = np.array([2.5])
+        metrics = await policy.update([exp], np.array([1.0]), advantages=advantages)
+        assert "loss" in metrics

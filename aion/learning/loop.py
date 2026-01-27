@@ -34,7 +34,8 @@ from aion.learning.types import (
     StateRepresentation,
 )
 from aion.learning.rewards.collector import RewardCollector
-from aion.learning.rewards.shaping import CompositeRewardShaper, CuriosityRewardShaper, PotentialBasedShaping
+from aion.learning.rewards.shaping import CompositeRewardShaper, PotentialBasedShaping
+from aion.learning.rewards.rnd import RNDCuriosityShaper
 from aion.learning.experience.buffer import ExperienceBuffer
 from aion.learning.experience.transition import NStepTransitionBuilder
 from aion.learning.policies.optimizer import PolicyOptimizer
@@ -71,17 +72,24 @@ class ReinforcementLearningLoop:
         self.reward_collector = RewardCollector(kernel, self._config.reward)
         self.experience_buffer = ExperienceBuffer(self._config.buffer)
         self.policy_optimizer = PolicyOptimizer(
-            kernel, self.experience_buffer, self._config.policy_optimizer
+            kernel,
+            self.experience_buffer,
+            self._config.policy_optimizer,
+            value_config=self._config.value_function,
+            rnd_config=self._config.rnd,
         )
         self.ab_testing = ABTestingFramework(kernel, self._config.experiment)
 
         # Bandit instances for fast online learning
         self._bandits: Dict[str, ThompsonSampling] = {}
 
-        # Reward shaping
+        # Reward shaping: PBRS (Ng et al., 1999) + RND curiosity (Burda et al., 2018)
+        # The RND shaper is shared with the optimizer so its predictor
+        # is trained during the background training loop.
+        self._rnd_shaper = self.policy_optimizer.rnd
         self._reward_shaper = CompositeRewardShaper()
         self._reward_shaper.add(PotentialBasedShaping(), weight=0.3)
-        self._reward_shaper.add(CuriosityRewardShaper(), weight=0.1)
+        self._reward_shaper.add(self._rnd_shaper, weight=0.1)
 
         # N-step transition builders per interaction
         self._nstep_builders: Dict[str, NStepTransitionBuilder] = {}

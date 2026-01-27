@@ -43,6 +43,30 @@ class BufferConfig:
 
 
 @dataclass
+class ValueFunctionConfig:
+    """Configuration for the state value function V(s) and target network."""
+
+    hidden_dim: int = 64
+    learning_rate: float = 0.001
+    gradient_clip: float = 1.0
+    tau: float = 0.005  # Polyak averaging coefficient for target network
+    gae_lambda: float = 0.95  # GAE discount factor
+    gamma: float = 0.99
+
+
+@dataclass
+class RNDConfig:
+    """Configuration for Random Network Distillation curiosity."""
+
+    embedding_dim: int = 32
+    hidden_dim: int = 64
+    learning_rate: float = 0.001
+    gradient_clip: float = 1.0
+    intrinsic_reward_scale: float = 0.1
+    normalise_intrinsic: bool = True
+
+
+@dataclass
 class PolicyOptimizerConfig:
     """Configuration for the policy optimizer."""
 
@@ -103,6 +127,8 @@ class LearningConfig:
     training_enabled: bool = True
     reward: RewardConfig = field(default_factory=RewardConfig)
     buffer: BufferConfig = field(default_factory=BufferConfig)
+    value_function: ValueFunctionConfig = field(default_factory=ValueFunctionConfig)
+    rnd: RNDConfig = field(default_factory=RNDConfig)
     policy_optimizer: PolicyOptimizerConfig = field(default_factory=PolicyOptimizerConfig)
     bandit: BanditConfig = field(default_factory=BanditConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)

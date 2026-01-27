@@ -1,13 +1,15 @@
 """
-AION Planning Strategy Policy
+AION Planning Strategy Policy (Actor-Critic)
 
 Learns to select the best planning strategy (e.g. greedy, MCTS,
 hierarchical, reactive) based on query characteristics.
+
+Uses advantage-based policy gradients with UCB exploration bonus.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -16,7 +18,7 @@ from aion.learning.policies.base import BasePolicy
 
 
 class PlanningStrategyPolicy(BasePolicy):
-    """Policy for planning strategy selection."""
+    """Actor policy for planning strategy selection."""
 
     def __init__(self, config: PolicyConfig):
         super().__init__(config)
@@ -60,11 +62,13 @@ class PlanningStrategyPolicy(BasePolicy):
         self,
         experiences: List[Experience],
         weights: np.ndarray,
+        advantages: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
+        """Advantage-based policy gradient update."""
         td_errors: List[float] = []
         total_loss = 0.0
 
-        for exp, w in zip(experiences, weights):
+        for i, (exp, w) in enumerate(zip(experiences, weights)):
             strategy = exp.action.choice
             reward = exp.cumulative_reward
             features = exp.state.to_vector()
@@ -73,19 +77,24 @@ class PlanningStrategyPolicy(BasePolicy):
                 self._weights[strategy] = np.zeros(len(features), dtype=np.float32)
                 self._bias[strategy] = 0.0
 
-            predicted = float(np.dot(self._weights[strategy], features)) + self._bias[strategy]
-            td_error = reward - predicted
-            td_errors.append(td_error)
+            # Use advantage if available, else fall back to TD residual
+            if advantages is not None and i < len(advantages):
+                advantage = float(advantages[i])
+            else:
+                predicted = float(np.dot(self._weights[strategy], features)) + self._bias[strategy]
+                advantage = reward - predicted
+
+            td_errors.append(advantage)
 
             lr = self.config.learning_rate * float(w)
-            grad = td_error * features
+            grad = advantage * features
             grad_norm = np.linalg.norm(grad)
             if grad_norm > self.config.gradient_clip:
                 grad = grad * (self.config.gradient_clip / grad_norm)
 
             self._weights[strategy] += lr * grad
-            self._bias[strategy] += lr * td_error
-            total_loss += td_error ** 2
+            self._bias[strategy] += lr * advantage
+            total_loss += advantage ** 2
 
             # Running average
             self._strategy_counts[strategy] = self._strategy_counts.get(strategy, 0) + 1

@@ -1,13 +1,17 @@
 """
-AION Agent Behavior Policy
+AION Agent Behavior Policy (Actor-Critic)
 
 Learns to select the best agent archetype or behavioral mode for
 a given task, optimising for task success and user satisfaction.
+
+Uses entropy-regularised softmax with advantage-based policy gradients.
+The entropy coefficient τ controls the exploration-exploitation tradeoff
+in a principled way (SAC-style: π(a|s) ∝ exp(Q(s,a)/τ)).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -16,7 +20,7 @@ from aion.learning.policies.base import BasePolicy
 
 
 class AgentBehaviorPolicy(BasePolicy):
-    """Policy for agent behavior / archetype selection."""
+    """Actor policy for agent behavior / archetype selection."""
 
     def __init__(self, config: PolicyConfig):
         super().__init__(config)
@@ -47,9 +51,7 @@ class AgentBehaviorPolicy(BasePolicy):
                 scores[behavior] = self._behavior_values.get(behavior, 0.0)
 
         # Entropy-regularised softmax (SAC-style):
-        # π(a|s) ∝ exp((Q(s,a) + τ·H) / τ) where τ = entropy_coefficient
-        # Adding entropy bonus to scores before softmax is equivalent to
-        # raising the temperature, encouraging exploration of uncertain actions.
+        # π(a|s) ∝ exp(Q(s,a) / τ) where τ = entropy_coefficient
         vals = np.array(list(scores.values()))
         tau = max(0.01, self.config.entropy_coefficient)
         log_probs = (vals - np.max(vals)) / tau
@@ -64,11 +66,18 @@ class AgentBehaviorPolicy(BasePolicy):
         self,
         experiences: List[Experience],
         weights: np.ndarray,
+        advantages: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
+        """Advantage-based policy gradient with entropy regularisation.
+
+        The entropy bonus encourages exploration by penalising
+        deterministic policies. Combined with GAE advantages from the
+        shared value function, this gives proper actor-critic updates.
+        """
         td_errors: List[float] = []
         total_loss = 0.0
 
-        for exp, w in zip(experiences, weights):
+        for i, (exp, w) in enumerate(zip(experiences, weights)):
             behavior = exp.action.choice
             reward = exp.cumulative_reward
             features = exp.state.to_vector()
@@ -77,19 +86,24 @@ class AgentBehaviorPolicy(BasePolicy):
                 self._weights[behavior] = np.zeros(len(features), dtype=np.float32)
                 self._bias[behavior] = 0.0
 
-            predicted = float(np.dot(self._weights[behavior], features)) + self._bias[behavior]
-            td_error = reward - predicted
-            td_errors.append(td_error)
+            # Use advantage if available, else fall back to TD residual
+            if advantages is not None and i < len(advantages):
+                advantage = float(advantages[i])
+            else:
+                predicted = float(np.dot(self._weights[behavior], features)) + self._bias[behavior]
+                advantage = reward - predicted
+
+            td_errors.append(advantage)
 
             lr = self.config.learning_rate * float(w)
-            grad = td_error * features
+            grad = advantage * features
             grad_norm = np.linalg.norm(grad)
             if grad_norm > self.config.gradient_clip:
                 grad = grad * (self.config.gradient_clip / grad_norm)
 
             self._weights[behavior] += lr * grad
-            self._bias[behavior] += lr * td_error
-            total_loss += td_error ** 2
+            self._bias[behavior] += lr * advantage
+            total_loss += advantage ** 2
 
             # Track per-behavior reward history
             self._reward_history.setdefault(behavior, []).append(reward)
