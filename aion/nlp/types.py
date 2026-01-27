@@ -771,17 +771,9 @@ class ValidationResult:
         self.test_details.extend(other.test_details)
         self.safety_concerns.extend(other.safety_concerns)
         self.safety_score = min(self.safety_score, other.safety_score)
-        # Recalculate safety level from merged score
-        if self.safety_score >= 0.9:
-            self.safety_level = SafetyLevel.SAFE
-        elif self.safety_score >= 0.7:
-            self.safety_level = SafetyLevel.LOW_RISK
-        elif self.safety_score >= 0.5:
-            self.safety_level = SafetyLevel.MEDIUM_RISK
-        elif self.safety_score >= 0.25:
-            self.safety_level = SafetyLevel.HIGH_RISK
-        else:
-            self.safety_level = SafetyLevel.DANGEROUS
+        # Recalculate safety level using the single source of truth
+        from aion.nlp.validation.safety import score_to_safety_level
+        self.safety_level = score_to_safety_level(self.safety_score)
         # Downgrade status if needed
         severity_order = [
             ValidationStatus.PASSED,

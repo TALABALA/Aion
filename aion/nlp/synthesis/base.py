@@ -75,10 +75,18 @@ class BaseSynthesizer(ABC):
     async def _llm_generate(
         self,
         prompt: str,
-        max_retries: int = 3,
+        max_retries: Optional[int] = None,
     ) -> str:
-        """Generate code using LLM with exponential backoff retry."""
+        """Generate code using LLM with exponential backoff + jitter retry."""
         import asyncio
+        import random
+
+        if max_retries is None:
+            max_retries = (
+                self._config.max_generation_retries
+                if self._config and hasattr(self._config, "max_generation_retries")
+                else 3
+            )
 
         last_error: Optional[Exception] = None
         for attempt in range(max_retries):
@@ -97,7 +105,8 @@ class BaseSynthesizer(ABC):
                     error=str(e),
                 )
                 if attempt < max_retries - 1:
-                    delay = 2 ** attempt  # 1s, 2s, 4s
+                    # Exponential backoff with jitter to prevent thundering herd
+                    delay = (2 ** attempt) + random.uniform(0, 1)
                     await asyncio.sleep(delay)
 
         if last_error:

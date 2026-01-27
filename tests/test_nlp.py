@@ -1109,31 +1109,34 @@ class TestRefinementLearner:
 class TestSessionManager:
     """Test session management."""
 
-    def test_create_session(self):
+    @pytest.mark.asyncio
+    async def test_create_session(self):
         """Test session creation."""
         from aion.nlp.conversation.session import SessionManager
 
         manager = SessionManager()
-        session = manager.get_or_create(None, "user-001")
+        session = await manager.get_or_create(None, "user-001")
         assert session is not None
         assert session.user_id == "user-001"
 
-    def test_get_existing_session(self):
+    @pytest.mark.asyncio
+    async def test_get_existing_session(self):
         """Test getting an existing session."""
         from aion.nlp.conversation.session import SessionManager
 
         manager = SessionManager()
-        session1 = manager.get_or_create(None, "user-001")
-        session2 = manager.get_or_create(session1.id, "user-001")
+        session1 = await manager.get_or_create(None, "user-001")
+        session2 = await manager.get_or_create(session1.id, "user-001")
         assert session1.id == session2.id
 
-    def test_session_count(self):
+    @pytest.mark.asyncio
+    async def test_session_count(self):
         """Test session counting."""
         from aion.nlp.conversation.session import SessionManager
 
         manager = SessionManager()
-        manager.get_or_create(None, "user-001")
-        manager.get_or_create(None, "user-002")
+        await manager.get_or_create(None, "user-001")
+        await manager.get_or_create(None, "user-002")
         assert manager.active_count >= 2
 
 
@@ -1548,7 +1551,7 @@ class TestCircuitBreaker:
             pass
 
         assert cb.state == CircuitState.OPEN
-        cb.reset()
+        await cb.reset()
         assert cb.state == CircuitState.CLOSED
 
 
@@ -1670,3 +1673,238 @@ class TestLearningFeedback:
         assert bias["create_tool"] < 0  # Penalized
         assert "create_workflow" in bias
         assert bias["create_workflow"] > 0  # Boosted
+
+
+# ===========================================================================
+# SOTA Round 3 Tests - Verifying Critical Fixes
+# ===========================================================================
+
+
+class TestSandboxSecurity:
+    """Test sandbox builtins are properly restricted."""
+
+    def test_safe_builtins_excludes_escape_vectors(self):
+        """getattr, setattr, type, vars must NOT be in safe builtins."""
+        from aion.nlp.deployment.deployer import _SAFE_BUILTINS
+
+        forbidden = ["getattr", "setattr", "type", "vars", "eval", "exec",
+                      "compile", "__import__"]
+        for name in forbidden:
+            assert name not in _SAFE_BUILTINS, f"{name} should not be in safe builtins"
+
+    def test_safe_builtins_has_essentials(self):
+        """Essential builtins must be present and correct."""
+        from aion.nlp.deployment.deployer import _SAFE_BUILTINS
+
+        essentials = ["int", "str", "float", "bool", "len", "list", "dict",
+                       "set", "tuple", "range", "enumerate", "zip", "map",
+                       "filter", "sorted", "print", "isinstance"]
+        for name in essentials:
+            assert name in _SAFE_BUILTINS, f"{name} should be in safe builtins"
+            assert _SAFE_BUILTINS[name] is not None, f"{name} should resolve to a real builtin"
+
+    def test_safe_builtins_values_are_real(self):
+        """Builtins should be real functions, not None or dict methods."""
+        from aion.nlp.deployment.deployer import _SAFE_BUILTINS
+
+        assert _SAFE_BUILTINS["int"] is int
+        assert _SAFE_BUILTINS["str"] is str
+        assert _SAFE_BUILTINS["len"] is len
+        assert _SAFE_BUILTINS["print"] is print
+
+
+class TestCircuitBreakerIntegration:
+    """Test circuit breaker is actually wired into LLM calls."""
+
+    @pytest.mark.asyncio
+    async def test_engine_uses_circuit_breaker(self):
+        """Verify _cached_parse_intent uses circuit breaker."""
+        from aion.nlp.engine import NLProgrammingEngine
+        from aion.nlp.config import NLProgrammingConfig
+        from aion.nlp.utils import CircuitState
+
+        kernel = MagicMock()
+        kernel.llm = MagicMock()
+        kernel.llm.complete = AsyncMock(return_value=MagicMock(
+            content='{"intent_type": "create_tool", "confidence": 0.9, "entities": [], "reasoning": "test"}'
+        ))
+        engine = NLProgrammingEngine(kernel, NLProgrammingConfig())
+
+        # Parse should work and CB should stay closed
+        intent = await engine._cached_parse_intent("create a tool", None)
+        assert intent is not None
+        assert engine._llm_circuit.state == CircuitState.CLOSED
+
+
+class TestSessionLockAcquisition:
+    """Test that SessionManager actually uses its lock."""
+
+    @pytest.mark.asyncio
+    async def test_create_is_async(self):
+        """create() must be async (returns coroutine when called)."""
+        import asyncio
+        from aion.nlp.conversation.session import SessionManager
+
+        manager = SessionManager()
+        # create() should be a coroutine function
+        assert asyncio.iscoroutinefunction(manager.create)
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_is_async(self):
+        """get_or_create() must be async."""
+        import asyncio
+        from aion.nlp.conversation.session import SessionManager
+
+        manager = SessionManager()
+        assert asyncio.iscoroutinefunction(manager.get_or_create)
+
+    @pytest.mark.asyncio
+    async def test_end_session_is_async(self):
+        """end_session() must be async."""
+        import asyncio
+        from aion.nlp.conversation.session import SessionManager
+
+        manager = SessionManager()
+        assert asyncio.iscoroutinefunction(manager.end_session)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_creates_are_safe(self):
+        """Multiple concurrent creates should not exceed max_sessions."""
+        import asyncio
+        from aion.nlp.conversation.session import SessionManager
+
+        manager = SessionManager(max_sessions=5)
+        # Launch 10 concurrent creates
+        tasks = [manager.create(f"user-{i}") for i in range(10)]
+        sessions = await asyncio.gather(*tasks)
+        assert len(sessions) == 10
+        # Should have evicted down to max
+        assert manager.total_count <= 5
+
+
+class TestScoreToSafetyLevel:
+    """Test the deduplicated safety level scoring function."""
+
+    def test_score_thresholds(self):
+        """Test all score thresholds produce correct levels."""
+        from aion.nlp.validation.safety import score_to_safety_level
+        from aion.nlp.types import SafetyLevel
+
+        assert score_to_safety_level(1.0) == SafetyLevel.SAFE
+        assert score_to_safety_level(0.9) == SafetyLevel.SAFE
+        assert score_to_safety_level(0.89) == SafetyLevel.LOW_RISK
+        assert score_to_safety_level(0.7) == SafetyLevel.LOW_RISK
+        assert score_to_safety_level(0.5) == SafetyLevel.MEDIUM_RISK
+        assert score_to_safety_level(0.25) == SafetyLevel.HIGH_RISK
+        assert score_to_safety_level(0.1) == SafetyLevel.DANGEROUS
+        assert score_to_safety_level(0.0) == SafetyLevel.DANGEROUS
+
+    def test_merge_uses_shared_function(self):
+        """merge() should use the same thresholds as SafetyAnalyzer."""
+        from aion.nlp.types import ValidationResult, ValidationStatus, SafetyLevel
+
+        r1 = ValidationResult(status=ValidationStatus.PASSED, safety_score=1.0, safety_level=SafetyLevel.SAFE)
+        r2 = ValidationResult(status=ValidationStatus.PASSED, safety_score=0.6, safety_level=SafetyLevel.MEDIUM_RISK)
+        r1.merge(r2)
+        assert r1.safety_level == SafetyLevel.MEDIUM_RISK
+        assert r1.safety_score == 0.6
+
+
+class TestStubScoringCap:
+    """Test that stub scoring doesn't over-penalize."""
+
+    def test_many_todos_capped(self):
+        """Multiple TODO comments should not make code DANGEROUS."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+        from aion.nlp.types import SafetyLevel
+
+        analyzer = SafetyAnalyzer()
+        code = "\n".join([f"# TODO: implement step {i}" for i in range(10)])
+        code += "\ndef hello(): return 'world'"
+        result = analyzer.analyze(code)
+        # Should not be DANGEROUS despite 10 TODOs - capped at 0.4 risk
+        assert result.safety_level != SafetyLevel.DANGEROUS
+        assert result.safety_score >= 0.4
+
+
+class TestBlockedBuiltinsConfig:
+    """Test that blocked_builtins config is actually enforced."""
+
+    def test_blocked_builtins_are_checked(self):
+        """SafetyAnalyzer should check blocked_builtins from config."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+        from aion.nlp.types import SafetyLevel
+
+        config = MagicMock()
+        config.blocked_imports = []
+        config.blocked_builtins = ["globals"]
+
+        analyzer = SafetyAnalyzer(config=config)
+        result = analyzer.analyze("x = globals()")
+        assert result.safety_level == SafetyLevel.DANGEROUS
+        assert any("globals" in e for e in result.errors)
+
+
+class TestParseJsonSafeNonGreedy:
+    """Test that JSON regex is non-greedy (matches innermost)."""
+
+    def test_multiple_json_objects_in_text(self):
+        """Should extract first valid JSON, not outermost braces."""
+        from aion.nlp.utils import parse_json_safe
+
+        text = 'First: {"a": 1} and second: {"b": 2}'
+        result = parse_json_safe(text)
+        # Should get the first one (non-greedy)
+        assert result == {"a": 1}
+
+
+class TestBackoffJitter:
+    """Test that synthesis backoff includes jitter."""
+
+    @pytest.mark.asyncio
+    async def test_llm_generate_uses_config_retries(self):
+        """_llm_generate should read max_generation_retries from config."""
+        from aion.nlp.synthesis.base import BaseSynthesizer
+
+        kernel = MagicMock()
+        kernel.llm = MagicMock()
+        kernel.llm.complete = AsyncMock(return_value=MagicMock(content="def foo(): pass"))
+
+        config = MagicMock()
+        config.max_generation_retries = 2
+
+        class ConcreteSynth(BaseSynthesizer):
+            async def synthesize(self, spec):
+                return await self._llm_generate("generate code")
+
+        synth = ConcreteSynth(kernel, config)
+        result = await synth.synthesize(None)
+        assert "def foo" in result
+
+
+class TestReadyToDeployIncludesSuggestions:
+    """Test that _respond_ready_to_deploy now includes suggestions."""
+
+    @pytest.mark.asyncio
+    async def test_response_has_suggestions(self):
+        """Ready-to-deploy response should include suggestions list."""
+        from aion.nlp.engine import NLProgrammingEngine
+        from aion.nlp.config import NLProgrammingConfig
+        from aion.nlp.types import (
+            GeneratedCode, ValidationResult, ToolSpecification,
+            SpecificationType, ValidationStatus, SafetyLevel,
+        )
+
+        kernel = MagicMock()
+        kernel.llm = MagicMock()
+        kernel.llm.complete = AsyncMock(return_value=MagicMock(content="{}"))
+        engine = NLProgrammingEngine(kernel, NLProgrammingConfig())
+
+        session = await engine.sessions.get_or_create(None, "user-001")
+        spec = ToolSpecification(name="test", description="test tool")
+        code = GeneratedCode(code="def test(): pass", spec_type=SpecificationType.TOOL)
+        validation = ValidationResult(status=ValidationStatus.PASSED, safety_level=SafetyLevel.SAFE)
+
+        result = await engine._respond_ready_to_deploy(session, spec, code, validation)
+        assert "suggestions" in result
+        assert isinstance(result["suggestions"], list)

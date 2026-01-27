@@ -38,18 +38,19 @@ class SessionManager:
         self._idle_timeout = idle_timeout_seconds
         self._lock = asyncio.Lock()
 
-    def create(self, user_id: str) -> ProgrammingSession:
-        """Create a new programming session."""
-        # Check capacity
-        if len(self._sessions) >= self._max_sessions:
-            self._cleanup_stale()
+    async def create(self, user_id: str) -> ProgrammingSession:
+        """Create a new programming session (async-safe)."""
+        async with self._lock:
+            # Check capacity
             if len(self._sessions) >= self._max_sessions:
-                # Remove oldest session
-                oldest = min(self._sessions.values(), key=lambda s: s.last_activity)
-                del self._sessions[oldest.id]
+                self._cleanup_stale()
+                if len(self._sessions) >= self._max_sessions:
+                    # Remove oldest session
+                    oldest = min(self._sessions.values(), key=lambda s: s.last_activity)
+                    del self._sessions[oldest.id]
 
-        session = ProgrammingSession(user_id=user_id)
-        self._sessions[session.id] = session
+            session = ProgrammingSession(user_id=user_id)
+            self._sessions[session.id] = session
 
         logger.debug("Session created", session_id=session.id, user_id=user_id)
         return session
@@ -61,18 +62,18 @@ class SessionManager:
             session.last_activity = datetime.now(timezone.utc)
         return session
 
-    def get_or_create(
+    async def get_or_create(
         self,
         session_id: Optional[str],
         user_id: str,
     ) -> ProgrammingSession:
-        """Get existing session or create new one."""
+        """Get existing session or create new one (async-safe)."""
         if session_id:
             session = self.get(session_id)
             if session:
                 return session
 
-        return self.create(user_id)
+        return await self.create(user_id)
 
     def list_user_sessions(self, user_id: str) -> List[ProgrammingSession]:
         """List all sessions for a user."""
@@ -81,13 +82,14 @@ class SessionManager:
             if s.user_id == user_id and s.state == "active"
         ]
 
-    def end_session(self, session_id: str) -> bool:
-        """End a programming session."""
-        session = self._sessions.get(session_id)
-        if session:
-            session.state = "completed"
-            logger.debug("Session ended", session_id=session_id)
-            return True
+    async def end_session(self, session_id: str) -> bool:
+        """End a programming session (async-safe)."""
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session:
+                session.state = "completed"
+                logger.debug("Session ended", session_id=session_id)
+                return True
         return False
 
     def _cleanup_stale(self) -> int:

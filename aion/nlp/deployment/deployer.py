@@ -10,6 +10,7 @@ SOTA deployment with:
 
 from __future__ import annotations
 
+import builtins as _builtins_module
 import importlib
 import sys
 import tempfile
@@ -36,25 +37,28 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
-# Restricted builtins for sandboxed execution - no exec/eval/compile/__import__
-_SAFE_BUILTINS = {
-    name: getattr(__builtins__ if isinstance(__builtins__, dict) else type(__builtins__), name, None)
-    for name in [
-        "abs", "all", "any", "bool", "bytes", "callable", "chr", "dict",
-        "divmod", "enumerate", "filter", "float", "format", "frozenset",
-        "getattr", "hasattr", "hash", "hex", "int", "isinstance",
-        "issubclass", "iter", "len", "list", "map", "max", "min",
-        "next", "oct", "ord", "pow", "print", "property", "range",
-        "repr", "reversed", "round", "set", "setattr", "slice",
-        "sorted", "staticmethod", "str", "sum", "super", "tuple",
-        "type", "vars", "zip",
-        "True", "False", "None",
-        "Exception", "ValueError", "TypeError", "KeyError", "RuntimeError",
-        "AttributeError", "IndexError", "StopIteration", "NotImplementedError",
-        "IOError", "OSError",
-    ]
-    if getattr(__builtins__ if isinstance(__builtins__, dict) else type(__builtins__), name, None) is not None
-}
+# Restricted builtins for sandboxed execution.
+# Security: excludes eval, exec, compile, __import__, getattr, setattr, type, vars
+# to prevent sandbox escape via attribute access or metaclass attacks.
+_SAFE_BUILTIN_NAMES = [
+    "abs", "all", "any", "bool", "bytes", "callable", "chr", "dict",
+    "divmod", "enumerate", "filter", "float", "format", "frozenset",
+    "hasattr", "hash", "hex", "int", "isinstance",
+    "issubclass", "iter", "len", "list", "map", "max", "min",
+    "next", "oct", "ord", "pow", "print", "property", "range",
+    "repr", "reversed", "round", "set", "slice",
+    "sorted", "staticmethod", "str", "sum", "super", "tuple",
+    "zip",
+    "True", "False", "None",
+    "Exception", "ValueError", "TypeError", "KeyError", "RuntimeError",
+    "AttributeError", "IndexError", "StopIteration", "NotImplementedError",
+    "IOError", "OSError",
+]
+_SAFE_BUILTINS: Dict[str, Any] = {}
+for _name in _SAFE_BUILTIN_NAMES:
+    _val = getattr(_builtins_module, _name, None)
+    if _val is not None:
+        _SAFE_BUILTINS[_name] = _val
 
 
 class DeploymentManager:
@@ -221,7 +225,7 @@ class DeploymentManager:
             "__file__": str(module_path),
         }
 
-        # Add safe standard library modules
+        # Add safe standard library modules via proxy to prevent __builtins__ escape
         safe_modules = {
             "json": "json",
             "re": "re",
@@ -239,7 +243,18 @@ class DeploymentManager:
         }
         for alias, mod_name in safe_modules.items():
             try:
-                restricted_globals[alias] = importlib.import_module(mod_name)
+                mod = importlib.import_module(mod_name)
+                # Create a namespace proxy that exposes module attributes
+                # but not __builtins__ or __loader__ (sandbox escape vectors)
+                proxy = type(mod_name, (), {
+                    k: v for k, v in vars(mod).items()
+                    if not k.startswith("__")
+                })
+                # Preserve module-level callables
+                for attr_name in dir(mod):
+                    if not attr_name.startswith("__"):
+                        setattr(proxy, attr_name, getattr(mod, attr_name))
+                restricted_globals[alias] = proxy
             except ImportError:
                 pass
 

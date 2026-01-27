@@ -53,7 +53,7 @@ from aion.nlp.refinement.learning import RefinementLearner
 from aion.nlp.conversation.session import SessionManager
 from aion.nlp.conversation.history import ConversationHistory
 from aion.nlp.conversation.suggestions import SuggestionEngine
-from aion.nlp.utils import TTLCache, CircuitBreaker
+from aion.nlp.utils import TTLCache, CircuitBreaker, CircuitBreakerOpenError
 
 if TYPE_CHECKING:
     from aion.core.kernel import AIONKernel
@@ -207,8 +207,8 @@ class NLProgrammingEngine:
         """
         start = time.monotonic()
 
-        # Get or create session
-        session = self.sessions.get_or_create(session_id, user_id)
+        # Get or create session (async-safe with lock)
+        session = await self.sessions.get_or_create(session_id, user_id)
 
         # Acquire per-session lock for concurrency safety
         lock = self._get_session_lock(session.id)
@@ -217,7 +217,12 @@ class NLProgrammingEngine:
             self.history.add_message(session, "user", user_input)
 
             try:
-                # Phase 1: Parse intent (with caching)
+                # Capture previous intent type for learning feedback
+                previous_intent_type = (
+                    session.current_intent.type if session.current_intent else None
+                )
+
+                # Phase 1: Parse intent (with caching + circuit breaker)
                 ctx = self.context.build_context(session)
                 intent = await self._cached_parse_intent(user_input, ctx)
 
@@ -225,6 +230,19 @@ class NLProgrammingEngine:
                 intent = await self.entity_extractor.extract(intent)
                 session.current_intent = intent
                 session.intent_history.append(intent)
+
+                # Record type-change correction for learning feedback loop
+                if (
+                    previous_intent_type is not None
+                    and previous_intent_type != intent.type
+                ):
+                    self.learner.record_correction(
+                        original=user_input,
+                        corrected=user_input,
+                        feedback="Intent type changed on follow-up",
+                        intent_type=intent.type,
+                        original_type=previous_intent_type,
+                    )
 
                 # Phase 3: Check if clarification needed
                 if intent.needs_clarification and self.config.deployment.require_confirmation:
@@ -364,9 +382,13 @@ class NLProgrammingEngine:
                     corrected=feedback,
                     feedback=feedback,
                     intent_type=session.current_intent.type,
+                    original_type=session.current_intent.type,
                 )
 
-            return self._respond_ready_to_deploy(session, session.current_spec, code, validation)
+            return await self._respond_ready_to_deploy(
+                session, session.current_spec, code, validation,
+                intent=session.current_intent,
+            )
 
         return await self.process(feedback, session_id=session_id, user_id=session.user_id)
 
@@ -390,8 +412,14 @@ class NLProgrammingEngine:
                 logger.debug("Intent cache hit", key=cache_key[:8])
                 return cached
 
-        # Parse with circuit breaker protection
-        intent = await self.intent_parser.parse(user_input, context=context)
+        # Parse with circuit breaker protection for LLM resilience
+        try:
+            intent = await self._llm_circuit.call(
+                self.intent_parser.parse, user_input, context=context
+            )
+        except CircuitBreakerOpenError:
+            logger.warning("Circuit breaker open, parsing without LLM protection")
+            intent = await self.intent_parser.parse(user_input, context=context)
 
         # Apply learned bias adjustments
         bias = self.learner.get_intent_bias()
@@ -405,8 +433,26 @@ class NLProgrammingEngine:
         return intent
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
-        """Get or create a per-session async lock."""
+        """Get or create a per-session async lock.
+
+        Bounded: evicts oldest locks when exceeding 2x max sessions
+        to prevent unbounded growth.
+        """
         if session_id not in self._session_locks:
+            # Evict stale locks if dict grows too large
+            max_locks = self.config.max_concurrent_sessions * 2
+            if len(self._session_locks) > max_locks:
+                # Remove locks for sessions that no longer exist
+                active_ids = {
+                    s.id for s in self.sessions._sessions.values()
+                    if s.state == "active"
+                }
+                stale = [
+                    k for k in self._session_locks
+                    if k not in active_ids
+                ]
+                for k in stale:
+                    del self._session_locks[k]
             self._session_locks[session_id] = asyncio.Lock()
         return self._session_locks[session_id]
 
@@ -453,7 +499,7 @@ class NLProgrammingEngine:
         if self.config.deployment.auto_deploy_on_pass and validation.is_valid:
             return await self.confirm_deploy(session.id)
 
-        return self._respond_ready_to_deploy(session, spec, code, validation)
+        return await self._respond_ready_to_deploy(session, spec, code, validation, intent=intent)
 
     async def _handle_modification(
         self,
@@ -688,14 +734,15 @@ Provide a clear, concise explanation."""
             "message": msg,
         }
 
-    def _respond_ready_to_deploy(
+    async def _respond_ready_to_deploy(
         self,
         session: ProgrammingSession,
         spec: Any,
         code: GeneratedCode,
         validation: ValidationResult,
+        intent: Optional[Intent] = None,
     ) -> Dict[str, Any]:
-        """Build ready-to-deploy response."""
+        """Build ready-to-deploy response with contextual suggestions."""
         spec_dict = spec.to_dict() if hasattr(spec, "to_dict") else {}
         code_preview = code.code[:500] + "..." if len(code.code) > 500 else code.code
 
@@ -704,6 +751,9 @@ Provide a clear, concise explanation."""
             msg = f"Code generated with {len(validation.warnings)} warning(s). Would you like to deploy?"
 
         self.history.add_message(session, "assistant", msg)
+
+        # Generate contextual suggestions with intent awareness
+        suggestions = await self.suggestions.generate(session, intent)
 
         return {
             "status": "ready_to_deploy",
@@ -720,6 +770,7 @@ Provide a clear, concise explanation."""
                 "tests_passed": validation.tests_passed,
                 "tests_failed": validation.tests_failed,
             },
+            "suggestions": suggestions,
             "message": msg,
         }
 

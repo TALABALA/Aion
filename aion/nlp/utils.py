@@ -57,8 +57,8 @@ def parse_json_safe(text: str) -> Dict[str, Any]:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Try to find any JSON object in the text
-    brace_match = re.search(r"\{[\s\S]*\}", text)
+    # Try to find any JSON object in the text (non-greedy to match innermost)
+    brace_match = re.search(r"\{[\s\S]*?\}", text)
     if brace_match:
         candidate = brace_match.group()
         try:
@@ -239,11 +239,12 @@ class CircuitBreaker:
                     threshold=self._failure_threshold,
                 )
 
-    def reset(self) -> None:
+    async def reset(self) -> None:
         """Manually reset the circuit breaker."""
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._half_open_calls = 0
+        async with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._half_open_calls = 0
 
     @property
     def stats(self) -> Dict[str, Any]:

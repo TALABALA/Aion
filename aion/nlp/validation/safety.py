@@ -29,6 +29,24 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def score_to_safety_level(score: float) -> SafetyLevel:
+    """Convert a safety score [0.0, 1.0] to a SafetyLevel.
+
+    This is the single source of truth for safety threshold boundaries.
+    Used by both SafetyAnalyzer and ValidationResult.merge().
+    """
+    if score >= 0.9:
+        return SafetyLevel.SAFE
+    elif score >= 0.7:
+        return SafetyLevel.LOW_RISK
+    elif score >= 0.5:
+        return SafetyLevel.MEDIUM_RISK
+    elif score >= 0.25:
+        return SafetyLevel.HIGH_RISK
+    else:
+        return SafetyLevel.DANGEROUS
+
+
 # Critical patterns: any single match immediately fails validation
 _CRITICAL_PATTERNS: List[Dict[str, Any]] = [
     {"pattern": r"\bos\.system\s*\(", "name": "os.system()", "reason": "Arbitrary shell command execution"},
@@ -118,6 +136,15 @@ class SafetyAnalyzer:
             result.status = ValidationStatus.FAILED
             return result
 
+        # Layer 1b: Config-driven blocked builtins check
+        blocked_found = self._check_blocked_builtins(code, result)
+        if blocked_found:
+            result.safety_score = 0.0
+            result.safety_level = SafetyLevel.DANGEROUS
+            result.add_error("Code uses blocked builtin functions")
+            result.status = ValidationStatus.FAILED
+            return result
+
         # Layer 2: High-risk patterns (graduated scoring)
         risk_score = self._check_high_risk_patterns(code, result)
 
@@ -125,10 +152,10 @@ class SafetyAnalyzer:
         import_risk = self._analyze_imports(code, result)
         risk_score += import_risk
 
-        # Layer 4: Stub detection
+        # Layer 4: Stub detection (capped to prevent over-penalization)
         stub_count = self._check_stubs(code, result)
         if stub_count > 0:
-            risk_score += 0.2 * stub_count
+            risk_score += min(0.2 * stub_count, 0.4)
 
         # Layer 5: File and network operations
         risk_score += self._check_io_operations(code, result)
@@ -284,15 +311,26 @@ class SafetyAnalyzer:
         )
         return 0.1
 
-    def _score_to_level(self, score: float) -> SafetyLevel:
+    def _check_blocked_builtins(self, code: str, result: ValidationResult) -> bool:
+        """Check for config-driven blocked builtins."""
+        if not self._blocked_builtins:
+            return False
+
+        found = False
+        for name in self._blocked_builtins:
+            pattern = rf"\b{re.escape(name)}\s*\("
+            if re.search(pattern, code):
+                found = True
+                result.safety_concerns.append(
+                    f"BLOCKED BUILTIN: {name}() - configured as blocked"
+                )
+                result.add_error(
+                    f"Blocked builtin: {name}()",
+                    rule="blocked_builtin",
+                )
+        return found
+
+    @staticmethod
+    def _score_to_level(score: float) -> SafetyLevel:
         """Convert safety score to level using aggressive thresholds."""
-        if score >= 0.9:
-            return SafetyLevel.SAFE
-        elif score >= 0.7:
-            return SafetyLevel.LOW_RISK
-        elif score >= 0.5:
-            return SafetyLevel.MEDIUM_RISK
-        elif score >= 0.25:
-            return SafetyLevel.HIGH_RISK
-        else:
-            return SafetyLevel.DANGEROUS
+        return score_to_safety_level(score)
