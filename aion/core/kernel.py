@@ -85,6 +85,13 @@ try:
 except ImportError:
     PLUGINS_AVAILABLE = False
 
+# Distributed computing imports (conditional to avoid import errors)
+try:
+    from aion.distributed.cluster.manager import ClusterManager
+    from aion.distributed.config import DistributedConfig
+    DISTRIBUTED_AVAILABLE = True
+except ImportError:
+    DISTRIBUTED_AVAILABLE = False
 # Reinforcement Learning Loop imports (conditional to avoid import errors)
 try:
     from aion.learning import ReinforcementLearningLoop, LearningConfig
@@ -187,6 +194,8 @@ class AIONKernel:
         # Plugin system
         self._plugin_manager = None
 
+        # Distributed computing
+        self._cluster_manager = None
         # Reinforcement Learning Loop
         self._rl_loop = None
 
@@ -419,6 +428,9 @@ class AIONKernel:
         if PLUGINS_AVAILABLE:
             await self._initialize_plugins()
 
+        # Initialize Distributed Computing System
+        if DISTRIBUTED_AVAILABLE and self.config.distributed_enabled:
+            await self._initialize_distributed()
         # Initialize Reinforcement Learning Loop
         if LEARNING_AVAILABLE:
             await self._initialize_learning()
@@ -589,6 +601,37 @@ class AIONKernel:
             logger.error(f"Plugin system initialization failed: {e}")
             self._update_health("plugins", SystemStatus.ERROR, str(e))
 
+    async def _initialize_distributed(self) -> None:
+        """Initialize the Distributed Computing System."""
+        try:
+            from aion.distributed.cluster.manager import ClusterManager
+            from aion.distributed.config import DistributedConfig
+
+            # Create distributed config
+            dist_config = DistributedConfig(
+                node_name=self.instance_id,
+            )
+
+            # Create cluster manager
+            self._cluster_manager = ClusterManager(
+                kernel=self,
+                config=dist_config.to_flat_dict(),
+            )
+
+            await self._cluster_manager.start()
+            self._update_health("distributed", SystemStatus.READY)
+            logger.info(
+                "Distributed computing system initialized",
+                node_id=self._cluster_manager.node_info.id,
+                node_name=self._cluster_manager.node_info.name,
+            )
+
+        except ImportError as e:
+            logger.warning(f"Distributed system not available: {e}")
+            self._update_health("distributed", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"Distributed system initialization failed: {e}")
+            self._update_health("distributed", SystemStatus.ERROR, str(e))
     async def _initialize_learning(self) -> None:
         """Initialize the Reinforcement Learning Loop."""
         try:
@@ -890,6 +933,9 @@ class AIONKernel:
         if self._plugin_manager:
             await self._plugin_manager.shutdown()
 
+        # Shutdown distributed computing
+        if self._cluster_manager:
+            await self._cluster_manager.stop()
         # Shutdown learning loop
         if self._rl_loop:
             await self._rl_loop.shutdown()
@@ -1481,6 +1527,16 @@ Output a JSON array of steps, each with:
             return []
         return self._plugin_manager.get_plugin_tools()
 
+    # ==================== Distributed Computing Access ====================
+
+    @property
+    def cluster(self):
+        """Get the cluster manager for distributed operations."""
+        return self._cluster_manager
+
+    def get_cluster_stats(self) -> dict[str, Any]:
+        """Get distributed cluster statistics."""
+        if not self._cluster_manager:
     # ==================== Reinforcement Learning Access ====================
 
     @property
@@ -1495,6 +1551,17 @@ Output a JSON array of steps, each with:
 
         return {
             "available": True,
+            **self._cluster_manager.get_stats(),
+        }
+
+    def get_cluster_info(self) -> dict[str, Any]:
+        """Get cluster information."""
+        if not self._cluster_manager:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._cluster_manager.get_cluster_info(),
             **self._rl_loop.get_stats(),
         }
 
