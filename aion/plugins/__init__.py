@@ -1,16 +1,20 @@
 """
-AION Plugin System
+AION Plugin System - State-of-the-Art Extensibility Framework
 
-A comprehensive extensibility framework for AION, enabling third-party
-plugins to extend functionality without modifying the core codebase.
+A production-grade, SOTA plugin architecture for AION, enabling third-party
+plugins to extend functionality with enterprise-level security and reliability.
 
-Features:
-- Plugin discovery and loading from multiple sources
+SOTA Features:
+- Process isolation (subprocess-based sandboxing like VS Code Extension Host)
+- Capability-based security (Deno-style permission model)
+- Circuit breaker & bulkhead patterns (fault isolation)
+- Cryptographic code signing (ED25519 verification)
+- OpenTelemetry integration (distributed tracing & metrics)
+- Hot module replacement with state preservation (Webpack/Vite-style HMR)
+- Resource quotas & limits enforcement
 - Full lifecycle management (load/unload/activate/suspend)
 - Dependency resolution with topological ordering
 - Hook system for extensibility points
-- Sandboxed execution with permission control
-- Hot reload support
 - Event emission for monitoring
 - REST API for management
 
@@ -32,6 +36,43 @@ Basic Usage:
 
     # Shutdown
     await manager.shutdown()
+
+Advanced Features:
+
+    # Process Isolation
+    from aion.plugins import ProcessIsolator
+    isolator = ProcessIsolator()
+    proxy = await isolator.create_isolated_plugin("my-plugin", path, entry_point)
+
+    # Circuit Breaker
+    from aion.plugins import CircuitBreaker
+    breaker = CircuitBreaker("my-service")
+    async with breaker:
+        result = await risky_operation()
+
+    # Capability Security
+    from aion.plugins import CapabilityChecker, Capability
+    checker = CapabilityChecker(plugin_id)
+    checker.grant(Capability.READ_FILE, allowed_paths=["/data/*"])
+    checker.check(Capability.READ_FILE, "/data/file.txt")
+
+    # Code Signing
+    from aion.plugins import PluginSigner, PluginVerifier
+    signer = PluginSigner(signing_key)
+    signature = signer.sign_plugin(path, plugin_id, version)
+
+    # Distributed Tracing
+    from aion.plugins import PluginTracer
+    tracer = PluginTracer(plugin_id)
+    with tracer.start_span("operation"):
+        # traced operation
+
+    # Hot Module Replacement
+    from aion.plugins import HotModuleReplacer
+    hmr = HotModuleReplacer(plugin_id, plugin_path)
+    hmr.state_transfer.register_dispose(module_id, dispose_handler)
+    hmr.state_transfer.register_accept(module_id, accept_handler)
+    await hmr.start()
 
 Plugin Development:
     from aion.plugins import BasePlugin, PluginManifest, PluginType
@@ -138,6 +179,76 @@ from aion.plugins.discovery.local import LocalDiscovery
 from aion.plugins.discovery.marketplace import MarketplaceClient, MarketplacePlugin
 
 from aion.plugins.api import create_plugin_routes, setup_plugin_routes
+
+# === SOTA Features ===
+
+# Process Isolation
+from aion.plugins.isolation import (
+    ProcessIsolator,
+    IsolatedPluginProxy,
+    PluginProcess,
+    ProcessConfig,
+    IPCMessage,
+    IPCMessageType,
+    ResourceQuota,
+    ResourceEnforcer,
+    ResourceViolation,
+)
+
+# Resilience (Circuit Breaker, Bulkhead, Retry)
+from aion.plugins.resilience import (
+    CircuitBreaker,
+    CircuitState,
+    CircuitBreakerConfig,
+    CircuitBreakerRegistry,
+    Bulkhead,
+    BulkheadConfig,
+    BulkheadRegistry,
+    BulkheadFullError,
+    RetryPolicy,
+    RetryConfig,
+    ExponentialBackoff,
+)
+
+# Security (Code Signing, Capabilities)
+from aion.plugins.security import (
+    PluginSigner,
+    PluginVerifier,
+    SignatureInfo,
+    SigningKey,
+    VerifyingKey,
+    SignatureError,
+    InvalidSignatureError,
+    ExpiredSignatureError,
+    Capability,
+    CapabilityGrant,
+    CapabilityChecker,
+    CapabilityDeniedError,
+    CapabilityPrompt,
+)
+
+# Telemetry (Tracing, Metrics)
+from aion.plugins.telemetry import (
+    PluginTracer,
+    SpanContext,
+    TracingConfig,
+    trace_plugin_operation,
+    PluginMetrics as TelemetryMetrics,
+    MetricsConfig,
+    Counter,
+    Gauge,
+    Histogram,
+)
+
+# Hot Module Replacement
+from aion.plugins.hotreload import (
+    HotModuleReplacer,
+    HMRConfig,
+    ModuleState,
+    StateTransfer,
+    HMREvent,
+    HMREventType,
+)
 
 
 __all__ = [
@@ -248,7 +359,65 @@ __all__ = [
     # === API ===
     "create_plugin_routes",
     "setup_plugin_routes",
+
+    # === SOTA: Process Isolation ===
+    "ProcessIsolator",
+    "IsolatedPluginProxy",
+    "PluginProcess",
+    "ProcessConfig",
+    "IPCMessage",
+    "IPCMessageType",
+    "ResourceQuota",
+    "ResourceEnforcer",
+    "ResourceViolation",
+
+    # === SOTA: Resilience ===
+    "CircuitBreaker",
+    "CircuitState",
+    "CircuitBreakerConfig",
+    "CircuitBreakerRegistry",
+    "Bulkhead",
+    "BulkheadConfig",
+    "BulkheadRegistry",
+    "BulkheadFullError",
+    "RetryPolicy",
+    "RetryConfig",
+    "ExponentialBackoff",
+
+    # === SOTA: Security ===
+    "PluginSigner",
+    "PluginVerifier",
+    "SignatureInfo",
+    "SigningKey",
+    "VerifyingKey",
+    "SignatureError",
+    "InvalidSignatureError",
+    "ExpiredSignatureError",
+    "Capability",
+    "CapabilityGrant",
+    "CapabilityChecker",
+    "CapabilityDeniedError",
+    "CapabilityPrompt",
+
+    # === SOTA: Telemetry ===
+    "PluginTracer",
+    "SpanContext",
+    "TracingConfig",
+    "trace_plugin_operation",
+    "TelemetryMetrics",
+    "MetricsConfig",
+    "Counter",
+    "Gauge",
+    "Histogram",
+
+    # === SOTA: Hot Module Replacement ===
+    "HotModuleReplacer",
+    "HMRConfig",
+    "ModuleState",
+    "StateTransfer",
+    "HMREvent",
+    "HMREventType",
 ]
 
 # Version
-__version__ = "1.0.0"
+__version__ = "2.0.0"  # Major version bump for SOTA features
