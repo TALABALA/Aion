@@ -1576,6 +1576,9 @@ Output a JSON array of steps, each with:
     def get_cluster_stats(self) -> dict[str, Any]:
         """Get distributed cluster statistics."""
         if not self._cluster_manager:
+            return {"available": False}
+        return self._cluster_manager.get_stats()
+
     # ==================== Reinforcement Learning Access ====================
 
     @property
