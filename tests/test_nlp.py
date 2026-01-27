@@ -1181,7 +1181,8 @@ class TestConversationHistory:
 class TestSuggestionEngine:
     """Test suggestion engine."""
 
-    def test_generate_suggestions(self):
+    @pytest.mark.asyncio
+    async def test_generate_suggestions(self):
         """Test suggestion generation."""
         from aion.nlp.conversation.suggestions import SuggestionEngine
         from aion.nlp.types import ProgrammingSession
@@ -1189,10 +1190,11 @@ class TestSuggestionEngine:
         engine = SuggestionEngine()
         session = ProgrammingSession(id="test-001", user_id="user-001")
 
-        suggestions = engine.generate(session)
+        suggestions = await engine.generate(session)
         assert isinstance(suggestions, list)
 
-    def test_suggestions_with_intent(self):
+    @pytest.mark.asyncio
+    async def test_suggestions_with_intent(self):
         """Test suggestions based on intent context."""
         from aion.nlp.conversation.suggestions import SuggestionEngine
         from aion.nlp.types import ProgrammingSession, Intent, IntentType
@@ -1205,7 +1207,7 @@ class TestSuggestionEngine:
             confidence=0.9,
         )
 
-        suggestions = engine.generate(session, intent)
+        suggestions = await engine.generate(session, intent)
         assert isinstance(suggestions, list)
 
 
@@ -1394,3 +1396,277 @@ class TestNLPModuleImports:
         from aion.nlp.api import router, setup_nlp_routes
         assert router is not None
         assert setup_nlp_routes is not None
+
+    def test_import_utils(self):
+        """Test importing the utility module."""
+        from aion.nlp.utils import parse_json_safe, TTLCache, CircuitBreaker, BoundedList
+        assert parse_json_safe is not None
+        assert TTLCache is not None
+        assert CircuitBreaker is not None
+        assert BoundedList is not None
+
+
+# ===========================================================================
+# SOTA Infrastructure Tests
+# ===========================================================================
+
+
+class TestParseJsonSafe:
+    """Test robust JSON parsing utility."""
+
+    def test_parse_raw_json(self):
+        from aion.nlp.utils import parse_json_safe
+        result = parse_json_safe('{"key": "value"}')
+        assert result == {"key": "value"}
+
+    def test_parse_empty_string(self):
+        from aion.nlp.utils import parse_json_safe
+        assert parse_json_safe("") == {}
+        assert parse_json_safe("   ") == {}
+
+    def test_parse_json_in_markdown(self):
+        from aion.nlp.utils import parse_json_safe
+        text = 'Here is the result:\n```json\n{"intent": "create_tool"}\n```'
+        result = parse_json_safe(text)
+        assert result == {"intent": "create_tool"}
+
+    def test_parse_json_embedded_in_prose(self):
+        from aion.nlp.utils import parse_json_safe
+        text = 'The output is: {"name": "test", "type": "tool"} as you can see.'
+        result = parse_json_safe(text)
+        assert result == {"name": "test", "type": "tool"}
+
+    def test_parse_trailing_commas(self):
+        from aion.nlp.utils import parse_json_safe
+        text = '{"key": "value",}'
+        result = parse_json_safe(text)
+        assert result == {"key": "value"}
+
+    def test_parse_garbage(self):
+        from aion.nlp.utils import parse_json_safe
+        assert parse_json_safe("not json at all") == {}
+
+
+class TestTTLCache:
+    """Test TTL-based LRU cache."""
+
+    @pytest.mark.asyncio
+    async def test_put_and_get(self):
+        from aion.nlp.utils import TTLCache
+        cache = TTLCache(max_size=10, ttl_seconds=60)
+        await cache.put("key1", "value1")
+        result = await cache.get("key1")
+        assert result == "value1"
+
+    @pytest.mark.asyncio
+    async def test_miss_returns_none(self):
+        from aion.nlp.utils import TTLCache
+        cache = TTLCache(max_size=10, ttl_seconds=60)
+        result = await cache.get("missing")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_eviction_on_overflow(self):
+        from aion.nlp.utils import TTLCache
+        cache = TTLCache(max_size=3, ttl_seconds=60)
+        await cache.put("a", 1)
+        await cache.put("b", 2)
+        await cache.put("c", 3)
+        await cache.put("d", 4)  # Should evict "a"
+        assert await cache.get("a") is None
+        assert await cache.get("d") == 4
+
+    @pytest.mark.asyncio
+    async def test_stats(self):
+        from aion.nlp.utils import TTLCache
+        cache = TTLCache(max_size=10, ttl_seconds=60)
+        await cache.put("k", "v")
+        await cache.get("k")
+        await cache.get("miss")
+        stats = cache.stats
+        assert stats["hits"] == 1
+        assert stats["misses"] == 1
+        assert stats["size"] == 1
+
+    @pytest.mark.asyncio
+    async def test_invalidate(self):
+        from aion.nlp.utils import TTLCache
+        cache = TTLCache(max_size=10, ttl_seconds=60)
+        await cache.put("k", "v")
+        await cache.invalidate("k")
+        assert await cache.get("k") is None
+
+
+class TestCircuitBreaker:
+    """Test circuit breaker pattern."""
+
+    @pytest.mark.asyncio
+    async def test_normal_operation(self):
+        from aion.nlp.utils import CircuitBreaker, CircuitState
+
+        cb = CircuitBreaker(failure_threshold=3, recovery_timeout=1.0)
+        assert cb.state == CircuitState.CLOSED
+
+        async def success():
+            return "ok"
+
+        result = await cb.call(success)
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_opens_after_threshold(self):
+        from aion.nlp.utils import CircuitBreaker, CircuitState, CircuitBreakerOpenError
+
+        cb = CircuitBreaker(failure_threshold=2, recovery_timeout=60.0)
+
+        async def fail():
+            raise ValueError("boom")
+
+        for _ in range(2):
+            try:
+                await cb.call(fail)
+            except ValueError:
+                pass
+
+        assert cb.state == CircuitState.OPEN
+
+        with pytest.raises(CircuitBreakerOpenError):
+            await cb.call(fail)
+
+    @pytest.mark.asyncio
+    async def test_reset(self):
+        from aion.nlp.utils import CircuitBreaker, CircuitState
+
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60.0)
+
+        async def fail():
+            raise ValueError("fail")
+
+        try:
+            await cb.call(fail)
+        except ValueError:
+            pass
+
+        assert cb.state == CircuitState.OPEN
+        cb.reset()
+        assert cb.state == CircuitState.CLOSED
+
+
+class TestBoundedList:
+    """Test bounded collection."""
+
+    def test_append_within_limit(self):
+        from aion.nlp.utils import BoundedList
+        bl = BoundedList(max_size=5)
+        for i in range(5):
+            bl.append(i)
+        assert len(bl) == 5
+
+    def test_eviction_on_overflow(self):
+        from aion.nlp.utils import BoundedList
+        bl = BoundedList(max_size=10)
+        for i in range(15):
+            bl.append(i)
+        assert len(bl) <= 10
+
+    def test_iteration(self):
+        from aion.nlp.utils import BoundedList
+        bl = BoundedList(max_size=100)
+        bl.append("a")
+        bl.append("b")
+        assert list(bl) == ["a", "b"]
+
+
+class TestSafetyAnalyzerSOTA:
+    """Test SOTA safety analyzer improvements."""
+
+    def test_eval_is_critical(self):
+        """Single eval() should immediately fail validation."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+        from aion.nlp.types import SafetyLevel
+
+        analyzer = SafetyAnalyzer()
+        result = analyzer.analyze("result = eval(user_input)")
+        assert result.safety_level == SafetyLevel.DANGEROUS
+        assert result.safety_score == 0.0
+        assert len(result.errors) > 0
+
+    def test_exec_is_critical(self):
+        """Single exec() should immediately fail validation."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+        from aion.nlp.types import SafetyLevel
+
+        analyzer = SafetyAnalyzer()
+        result = analyzer.analyze("exec(code)")
+        assert result.safety_level == SafetyLevel.DANGEROUS
+        assert result.safety_score == 0.0
+
+    def test_not_implemented_detected(self):
+        """NotImplementedError stubs should be detected."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+
+        analyzer = SafetyAnalyzer()
+        result = analyzer.analyze('def handler():\n    raise NotImplementedError("todo")')
+        assert any("Incomplete code" in c for c in result.safety_concerns)
+
+    def test_todo_comments_detected(self):
+        """TODO comments should be flagged."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+
+        analyzer = SafetyAnalyzer()
+        result = analyzer.analyze("# TODO: implement this\ndef foo(): pass")
+        assert any("TODO" in c for c in result.safety_concerns)
+
+    def test_safe_code_passes(self):
+        """Clean code should get high safety score."""
+        from aion.nlp.validation.safety import SafetyAnalyzer
+        from aion.nlp.types import SafetyLevel
+
+        analyzer = SafetyAnalyzer()
+        result = analyzer.analyze("import json\ndef parse(data): return json.loads(data)")
+        assert result.safety_score >= 0.9
+        assert result.safety_level == SafetyLevel.SAFE
+
+
+class TestLearningFeedback:
+    """Test learning system feedback loop."""
+
+    def test_confusion_matrix(self):
+        """Test that corrections build a confusion matrix."""
+        from aion.nlp.refinement.learning import RefinementLearner
+        from aion.nlp.types import IntentType
+
+        learner = RefinementLearner()
+        for _ in range(5):
+            learner.record_correction(
+                original="make a tool",
+                corrected="create workflow",
+                feedback="this should be a workflow",
+                intent_type=IntentType.CREATE_WORKFLOW,
+                original_type=IntentType.CREATE_TOOL,
+            )
+
+        matrix = learner.get_confusion_matrix()
+        assert "create_tool" in matrix
+        assert matrix["create_tool"]["create_workflow"] == 5
+
+    def test_intent_bias(self):
+        """Test that learning produces bias adjustments."""
+        from aion.nlp.refinement.learning import RefinementLearner
+        from aion.nlp.types import IntentType
+
+        learner = RefinementLearner()
+        for _ in range(5):
+            learner.record_correction(
+                original="x",
+                corrected="y",
+                feedback="fix",
+                intent_type=IntentType.CREATE_WORKFLOW,
+                original_type=IntentType.CREATE_TOOL,
+            )
+
+        bias = learner.get_intent_bias()
+        assert "create_tool" in bias
+        assert bias["create_tool"] < 0  # Penalized
+        assert "create_workflow" in bias
+        assert bias["create_workflow"] > 0  # Boosted

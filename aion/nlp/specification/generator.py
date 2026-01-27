@@ -304,8 +304,8 @@ Respond with ONLY valid JSON containing the enhanced fields:
             )
             content = response.content if hasattr(response, "content") else str(response)
 
-            import json
-            data = json.loads(content) if content.strip().startswith("{") else {}
+            from aion.nlp.utils import parse_json_safe
+            data = parse_json_safe(content)
 
             # Merge enhanced parameters (only if spec has empty parameters)
             if data.get("enhanced_parameters") and hasattr(spec, "parameters"):

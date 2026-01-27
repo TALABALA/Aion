@@ -10,9 +10,14 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, FrozenSet, List, Optional, Protocol, Set, Tuple, Union
+
+
+def _utcnow() -> datetime:
+    """Return timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
 
 
 # =============================================================================
@@ -667,7 +672,7 @@ class GeneratedCode:
     # Generation metadata
     generation_model: str = ""
     generation_temperature: float = 0.0
-    generation_timestamp: datetime = field(default_factory=datetime.now)
+    generation_timestamp: datetime = field(default_factory=_utcnow)
     iteration: int = 1
 
     @property
@@ -676,6 +681,11 @@ class GeneratedCode:
         for artifact in self.artifacts:
             parts.append(f"\n# --- {artifact.filename} ---\n{artifact.code}")
         return "\n".join(parts)
+
+    @property
+    def line_count(self) -> int:
+        """Count lines of primary code."""
+        return len(self.code.strip().splitlines()) if self.code.strip() else 0
 
     @property
     def fingerprint(self) -> str:
@@ -761,6 +771,17 @@ class ValidationResult:
         self.test_details.extend(other.test_details)
         self.safety_concerns.extend(other.safety_concerns)
         self.safety_score = min(self.safety_score, other.safety_score)
+        # Recalculate safety level from merged score
+        if self.safety_score >= 0.9:
+            self.safety_level = SafetyLevel.SAFE
+        elif self.safety_score >= 0.7:
+            self.safety_level = SafetyLevel.LOW_RISK
+        elif self.safety_score >= 0.5:
+            self.safety_level = SafetyLevel.MEDIUM_RISK
+        elif self.safety_score >= 0.25:
+            self.safety_level = SafetyLevel.HIGH_RISK
+        else:
+            self.safety_level = SafetyLevel.DANGEROUS
         # Downgrade status if needed
         severity_order = [
             ValidationStatus.PASSED,
@@ -783,7 +804,7 @@ class DeploymentRecord:
 
     version: int
     code_fingerprint: str
-    deployed_at: datetime = field(default_factory=datetime.now)
+    deployed_at: datetime = field(default_factory=_utcnow)
     deployed_by: str = ""
     change_summary: str = ""
     rollback_safe: bool = True
@@ -812,8 +833,8 @@ class DeployedSystem:
     deployment_history: List[DeploymentRecord] = field(default_factory=list)
 
     # Timestamps
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     created_by: str = ""
 
     # Metrics
@@ -822,9 +843,13 @@ class DeployedSystem:
     success_count: int = 0
     avg_latency_ms: float = 0.0
     p99_latency_ms: float = 0.0
+    _latency_reservoir: List[float] = field(default_factory=list, repr=False)
 
     # Tags
     tags: List[str] = field(default_factory=list)
+
+    # Max reservoir size for p99 calculation
+    _RESERVOIR_SIZE: int = field(default=1000, repr=False, init=False)
 
     @property
     def error_rate(self) -> float:
@@ -844,11 +869,21 @@ class DeployedSystem:
             self.success_count += 1
         else:
             self.error_count += 1
+
         # Exponential moving average for latency
         alpha = 0.1
         self.avg_latency_ms = alpha * latency_ms + (1 - alpha) * self.avg_latency_ms
-        self.p99_latency_ms = max(self.p99_latency_ms, latency_ms)
-        self.updated_at = datetime.now()
+
+        # Reservoir sampling for true p99 calculation
+        self._latency_reservoir.append(latency_ms)
+        if len(self._latency_reservoir) > self._RESERVOIR_SIZE:
+            self._latency_reservoir = self._latency_reservoir[-self._RESERVOIR_SIZE:]
+        if self._latency_reservoir:
+            sorted_latencies = sorted(self._latency_reservoir)
+            p99_index = min(len(sorted_latencies) - 1, int(len(sorted_latencies) * 0.99))
+            self.p99_latency_ms = sorted_latencies[p99_index]
+
+        self.updated_at = _utcnow()
 
 
 # =============================================================================
@@ -862,7 +897,7 @@ class ConversationMessage:
 
     role: str  # "user", "assistant", "system"
     content: str
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=_utcnow)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -901,8 +936,8 @@ class ProgrammingSession:
     state: str = "active"  # active, paused, completed, abandoned
 
     # Timestamps
-    started_at: datetime = field(default_factory=datetime.now)
-    last_activity: datetime = field(default_factory=datetime.now)
+    started_at: datetime = field(default_factory=_utcnow)
+    last_activity: datetime = field(default_factory=_utcnow)
 
     def add_message(self, role: str, content: str, **metadata: Any) -> None:
         self.messages.append(ConversationMessage(
@@ -910,7 +945,7 @@ class ProgrammingSession:
             content=content,
             metadata=metadata,
         ))
-        self.last_activity = datetime.now()
+        self.last_activity = _utcnow()
 
     def get_context_window(self, max_messages: int = 20) -> List[ConversationMessage]:
         """Get recent messages for context."""

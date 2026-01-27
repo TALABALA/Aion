@@ -6,7 +6,8 @@ Handles session lifecycle, cleanup, and state management.
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import structlog
@@ -35,6 +36,7 @@ class SessionManager:
         self._sessions: Dict[str, ProgrammingSession] = {}
         self._max_sessions = max_sessions
         self._idle_timeout = idle_timeout_seconds
+        self._lock = asyncio.Lock()
 
     def create(self, user_id: str) -> ProgrammingSession:
         """Create a new programming session."""
@@ -56,7 +58,7 @@ class SessionManager:
         """Get a session by ID."""
         session = self._sessions.get(session_id)
         if session:
-            session.last_activity = datetime.now()
+            session.last_activity = datetime.now(timezone.utc)
         return session
 
     def get_or_create(
@@ -90,7 +92,7 @@ class SessionManager:
 
     def _cleanup_stale(self) -> int:
         """Remove stale sessions. Returns count removed."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         stale = [
             sid for sid, session in self._sessions.items()
             if (now - session.last_activity).total_seconds() > self._idle_timeout

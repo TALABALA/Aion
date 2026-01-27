@@ -315,8 +315,8 @@ Respond with ONLY valid JSON:
             )
             content = response.content if hasattr(response, "content") else str(response)
 
-            import json
-            data = json.loads(content) if content.strip().startswith("{") else {}
+            from aion.nlp.utils import parse_json_safe
+            data = parse_json_safe(content)
 
             if data.get("additional_entities"):
                 for ent in data["additional_entities"]:

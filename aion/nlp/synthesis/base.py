@@ -77,7 +77,10 @@ class BaseSynthesizer(ABC):
         prompt: str,
         max_retries: int = 3,
     ) -> str:
-        """Generate code using LLM with retry logic."""
+        """Generate code using LLM with exponential backoff retry."""
+        import asyncio
+
+        last_error: Optional[Exception] = None
         for attempt in range(max_retries):
             try:
                 response = await self.kernel.llm.complete(
@@ -86,14 +89,19 @@ class BaseSynthesizer(ABC):
                 content = response.content if hasattr(response, "content") else str(response)
                 return self._clean_code_response(content)
             except Exception as e:
+                last_error = e
                 logger.warning(
                     "LLM generation attempt failed",
                     attempt=attempt + 1,
+                    max_retries=max_retries,
                     error=str(e),
                 )
-                if attempt == max_retries - 1:
-                    raise
+                if attempt < max_retries - 1:
+                    delay = 2 ** attempt  # 1s, 2s, 4s
+                    await asyncio.sleep(delay)
 
+        if last_error:
+            raise last_error
         return ""
 
     # =========================================================================

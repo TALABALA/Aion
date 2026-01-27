@@ -15,10 +15,10 @@ from pydantic import BaseModel, Field
 class IntentClassificationConfig(BaseModel):
     """Configuration for the intent classification pipeline."""
 
-    # Ensemble weights for SOTA classification
-    llm_weight: float = Field(default=0.5, ge=0.0, le=1.0)
-    pattern_weight: float = Field(default=0.3, ge=0.0, le=1.0)
-    semantic_weight: float = Field(default=0.2, ge=0.0, le=1.0)
+    # Ensemble weights: pattern (fast, deterministic) + LLM (deep, semantic)
+    # Weights are normalized at scoring time, so they don't need to sum to 1.0
+    llm_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    pattern_weight: float = Field(default=0.4, ge=0.0, le=1.0)
 
     # Confidence thresholds
     min_confidence: float = Field(default=0.4, ge=0.0, le=1.0)
@@ -35,7 +35,6 @@ class EntityExtractionConfig(BaseModel):
     # Extraction methods
     use_regex: bool = True
     use_llm: bool = True
-    use_spacy: bool = False
 
     # Confidence
     min_entity_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -122,8 +121,8 @@ class DeploymentConfig(BaseModel):
     auto_rollback_on_error: bool = True
     error_rate_threshold: float = Field(default=0.1, ge=0.0, le=1.0)
 
-    # Registry
-    registry_backend: Literal["memory", "sqlite", "redis"] = "memory"
+    # Registry (memory-backed; persistent backends planned for future)
+    registry_backend: Literal["memory"] = "memory"
 
 
 class SessionConfig(BaseModel):
@@ -175,4 +174,9 @@ class NLProgrammingConfig(BaseModel):
     # Performance
     enable_caching: bool = True
     cache_ttl_seconds: int = 300
+    cache_max_size: int = 256
     max_concurrent_sessions: int = 100
+
+    # Circuit breaker for LLM calls
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery_seconds: float = 30.0

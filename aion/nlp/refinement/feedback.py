@@ -7,6 +7,7 @@ Interprets user feedback to modify specifications and regenerate code.
 from __future__ import annotations
 
 import json
+from enum import Enum
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import structlog
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
-class FeedbackType:
+class FeedbackType(str, Enum):
     """Classification of feedback types."""
 
     ADD_FEATURE = "add_feature"
@@ -175,7 +176,9 @@ Respond with ONLY valid JSON:
                 [{"role": "user", "content": prompt}]
             )
             content = response.content if hasattr(response, "content") else str(response)
-            return json.loads(content) if content.strip().startswith("{") else {"changes": [], "summary": feedback}
+            from aion.nlp.utils import parse_json_safe
+            result = parse_json_safe(content)
+            return result if result.get("changes") is not None else {"changes": [], "summary": feedback}
         except Exception as e:
             logger.debug("LLM feedback extraction failed", error=str(e))
             return {"changes": [], "summary": feedback}
