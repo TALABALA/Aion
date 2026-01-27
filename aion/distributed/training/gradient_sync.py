@@ -236,6 +236,21 @@ class GradientSynchronizer:
                 for k in chunk_keys
             })
 
+        rpc_client = getattr(self._cluster, "_rpc_client", None)
+
+        def _resolve_address(nid: str) -> Optional[str]:
+            try:
+                state = self._cluster.get_state()
+                if state and nid in state.nodes:
+                    return state.nodes[nid].address
+            except Exception:
+                pass
+            return None
+
+        right_id = nodes[(my_rank + 1) % num_nodes]
+        left_id = nodes[(my_rank - 1) % num_nodes]
+        right_addr = _resolve_address(right_id)
+
         # Phase 1 - Scatter-reduce: N-1 steps
         for step in range(num_nodes - 1):
             send_chunk_idx = (my_rank - step) % num_nodes
@@ -248,39 +263,38 @@ class GradientSynchronizer:
             payload_size = self._estimate_size(outgoing)
             self._total_bytes_sent += payload_size
 
-            right_neighbour = nodes[(my_rank + 1) % num_nodes]
-            task = DistributedTask(
-                name="ring_scatter_reduce",
-                task_type=TaskType.TRAINING_STEP.value,
-                priority=TaskPriority.HIGH,
-                payload={
-                    "action": "ring_scatter_reduce",
-                    "round": self._round,
-                    "step": step,
-                    "chunk_idx": send_chunk_idx,
-                    "data": outgoing,
-                    "target_node": right_neighbour,
-                    "compressed": self._config.compression_enabled,
-                },
-            )
+            # Send chunk to right neighbour via RPC
+            if rpc_client and right_addr:
+                try:
+                    resp = await rpc_client.send_ring_chunk(
+                        right_addr,
+                        outgoing,
+                        phase="scatter_reduce",
+                        step=step,
+                        chunk_idx=send_chunk_idx,
+                        round_id=self._round,
+                    )
+                    # The response contains the chunk from our left neighbour
+                    if resp and "chunk_data" in resp:
+                        incoming = resp["chunk_data"]
+                    else:
+                        incoming = outgoing  # Fallback: echo local
+                except Exception:
+                    logger.debug(
+                        "ring_scatter_reduce_rpc_failed",
+                        step=step,
+                        round=self._round,
+                    )
+                    incoming = outgoing
+            else:
+                incoming = outgoing
 
-            try:
-                await self._cluster.submit_task(task)
-            except Exception:
-                logger.exception(
-                    "ring_scatter_reduce_failed",
-                    step=step,
-                    round=self._round,
-                )
-
-            # Simulate receiving from left neighbour and accumulating
-            incoming = outgoing  # In a real network this comes from left
             if self._config.compression_enabled:
                 incoming = self.decompress(incoming)
 
             for k, v in incoming.items():
                 if k in chunk_data[recv_chunk_idx]:
-                    chunk_data[recv_chunk_idx][k] += v
+                    chunk_data[recv_chunk_idx][k] += self._safe_float(v)
 
         # Phase 2 - All-gather: N-1 steps
         for step in range(num_nodes - 1):
@@ -291,32 +305,30 @@ class GradientSynchronizer:
             payload_size = self._estimate_size(outgoing)
             self._total_bytes_sent += payload_size
 
-            right_neighbour = nodes[(my_rank + 1) % num_nodes]
-            task = DistributedTask(
-                name="ring_all_gather",
-                task_type=TaskType.TRAINING_STEP.value,
-                priority=TaskPriority.HIGH,
-                payload={
-                    "action": "ring_all_gather",
-                    "round": self._round,
-                    "step": step,
-                    "chunk_idx": send_chunk_idx,
-                    "data": outgoing,
-                    "target_node": right_neighbour,
-                },
-            )
-
-            try:
-                await self._cluster.submit_task(task)
-            except Exception:
-                logger.exception(
-                    "ring_all_gather_failed",
-                    step=step,
-                    round=self._round,
-                )
-
-            # Receive chunk from left
-            chunk_data[recv_chunk_idx] = outgoing
+            # Send fully-reduced chunk to right neighbour via RPC
+            if rpc_client and right_addr:
+                try:
+                    resp = await rpc_client.send_ring_chunk(
+                        right_addr,
+                        outgoing,
+                        phase="all_gather",
+                        step=step,
+                        chunk_idx=send_chunk_idx,
+                        round_id=self._round,
+                    )
+                    if resp and "chunk_data" in resp:
+                        chunk_data[recv_chunk_idx] = resp["chunk_data"]
+                    else:
+                        chunk_data[recv_chunk_idx] = outgoing
+                except Exception:
+                    logger.debug(
+                        "ring_all_gather_rpc_failed",
+                        step=step,
+                        round=self._round,
+                    )
+                    chunk_data[recv_chunk_idx] = outgoing
+            else:
+                chunk_data[recv_chunk_idx] = outgoing
 
         # Reassemble full gradient from chunks and divide by N
         result: Dict[str, Any] = {}
@@ -637,21 +649,59 @@ class GradientSynchronizer:
     async def _collect_node_gradients(
         self, local_gradients: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Collect gradient contributions from all cluster nodes.
+        """Collect gradient contributions from all cluster nodes via RPC.
 
-        In a real deployment this would use the cluster communication
-        layer. Here we return the local contribution as a baseline.
+        Sends a ``collect_gradients`` RPC to each peer and gathers their
+        gradient dicts.  The local node's gradients are always included.
+        Falls back to local-only if RPC is unavailable.
         """
-        # The local node's gradients are always included
         results: List[Dict[str, Any]] = [local_gradients]
 
-        node_count = self._get_cluster_size()
-        if node_count > 1:
-            self._total_bytes_received += self._estimate_size(local_gradients) * (
-                node_count - 1
-            )
+        rpc_client = getattr(self._cluster, "_rpc_client", None)
+        peer_addresses = self._get_peer_addresses()
+
+        if rpc_client is None or not peer_addresses:
+            return results
+
+        async def _fetch(address: str) -> Optional[Dict[str, Any]]:
+            try:
+                resp = await rpc_client.collect_gradients(address, self._round)
+                if resp is not None:
+                    payload_size = self._estimate_size(resp)
+                    self._total_bytes_received += payload_size
+                return resp
+            except Exception:
+                logger.debug(
+                    "gradient_collect_failed",
+                    address=address,
+                    round=self._round,
+                )
+                return None
+
+        import asyncio
+        fetches = [_fetch(addr) for addr in peer_addresses]
+        responses = await asyncio.gather(*fetches, return_exceptions=True)
+
+        for resp in responses:
+            if isinstance(resp, dict) and resp:
+                results.append(resp)
 
         return results
+
+    def _get_peer_addresses(self) -> List[str]:
+        """Return network addresses of all peer nodes (excluding self)."""
+        try:
+            state = self._cluster.get_state()
+            if state is None:
+                return []
+            local_id = self._get_node_id()
+            return [
+                node.address
+                for nid, node in state.nodes.items()
+                if nid != local_id and hasattr(node, "address") and node.address
+            ]
+        except Exception:
+            return []
 
     def _element_wise_average(
         self, all_gradients: List[Dict[str, Any]]

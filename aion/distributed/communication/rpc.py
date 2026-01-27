@@ -507,6 +507,179 @@ class RPCClient:
             address, "share_experiences", {"experiences": experiences},
         )
 
+    # -- Data replication ----------------------------------------------------
+
+    async def send_replicate(
+        self,
+        address: str,
+        data_key: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Replicate a data key/shard to the node at *address*.
+
+        The receiving node should store the payload and update its
+        local replica records.
+        """
+        data = {"data_key": data_key}
+        if payload is not None:
+            data["payload"] = payload
+        return await self._make_request(address, "replicate", data)
+
+    # -- Failure detection ---------------------------------------------------
+
+    async def indirect_ping(
+        self,
+        proxy_address: str,
+        target_node_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the proxy node to ping *target_node_id* on our behalf.
+
+        Part of the SWIM protocol: if the proxy can reach the target,
+        it responds with ``{"reachable": true}``.
+        """
+        return await self._make_request(
+            proxy_address,
+            "indirect_ping",
+            {"target_node_id": target_node_id},
+        )
+
+    # -- State synchronization (anti-entropy) --------------------------------
+
+    async def fetch_state_digest(
+        self,
+        address: str,
+    ) -> Optional[str]:
+        """Fetch the Merkle root digest from the remote node.
+
+        Returns the hex digest string, or ``None`` on failure.
+        """
+        result = await self._make_request(address, "state_digest", {})
+        if result is None:
+            return None
+        return result.get("digest", "")
+
+    async def fetch_remote_state(
+        self,
+        address: str,
+        keys: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch state entries from the remote node.
+
+        If *keys* is provided, only those keys are requested; otherwise
+        the full state is returned.
+        """
+        data: Dict[str, Any] = {}
+        if keys is not None:
+            data["keys"] = keys
+        return await self._make_request(address, "state_fetch", data)
+
+    async def push_state_batch(
+        self,
+        address: str,
+        state_entries: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Push a batch of state entries to the remote node."""
+        return await self._make_request(
+            address,
+            "state_push",
+            {"entries": state_entries},
+        )
+
+    async def fetch_state_key_hashes(
+        self,
+        address: str,
+    ) -> Optional[Dict[str, str]]:
+        """Fetch per-key hashes for divergence detection.
+
+        Returns a dict mapping keys to their SHA-256 content hashes.
+        """
+        result = await self._make_request(address, "state_key_hashes", {})
+        if result is None:
+            return None
+        return result.get("key_hashes", {})
+
+    # -- Distributed memory (shard-level ops) --------------------------------
+
+    async def shard_write(
+        self,
+        address: str,
+        key: str,
+        value: Any,
+        vector_clock: Optional[Dict[str, int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Write a key/value pair to a specific shard node."""
+        data: Dict[str, Any] = {"key": key, "value": value}
+        if vector_clock is not None:
+            data["vector_clock"] = vector_clock
+        return await self._make_request(address, "shard_write", data)
+
+    async def shard_read(
+        self,
+        address: str,
+        key: str,
+    ) -> Optional[Any]:
+        """Read a value by key from a specific shard node."""
+        result = await self._make_request(address, "shard_read", {"key": key})
+        if result is None:
+            return None
+        return result.get("value")
+
+    async def shard_delete(
+        self,
+        address: str,
+        key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Delete a key from a specific shard node."""
+        return await self._make_request(address, "shard_delete", {"key": key})
+
+    # -- Gradient synchronization (ring all-reduce) --------------------------
+
+    async def send_ring_chunk(
+        self,
+        address: str,
+        chunk_data: Dict[str, Any],
+        phase: str,
+        step: int,
+        chunk_idx: int,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a gradient chunk to a ring neighbour.
+
+        Used by both scatter-reduce and all-gather phases of ring
+        all-reduce.
+
+        Args:
+            address: Target node address.
+            chunk_data: Gradient chunk dict.
+            phase: ``"scatter_reduce"`` or ``"all_gather"``.
+            step: Step number within the phase.
+            chunk_idx: Index of the chunk.
+            round_id: Global synchronisation round number.
+        """
+        return await self._make_request(
+            address,
+            "ring_chunk",
+            {
+                "chunk_data": chunk_data,
+                "phase": phase,
+                "step": step,
+                "chunk_idx": chunk_idx,
+                "round": round_id,
+            },
+        )
+
+    async def collect_gradients(
+        self,
+        address: str,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Collect gradient contributions from a peer node."""
+        return await self._make_request(
+            address,
+            "collect_gradients",
+            {"round": round_id},
+        )
+
     # -- Diagnostics ---------------------------------------------------------
 
     def get_stats(self) -> Dict[str, Any]:

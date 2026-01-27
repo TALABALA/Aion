@@ -25,8 +25,11 @@ References:
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import structlog
@@ -37,6 +40,8 @@ from aion.distributed.consensus.state_machine import ConsensusStateMachine
 from aion.distributed.types import (
     AppendEntriesRequest,
     AppendEntriesResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
     NodeInfo,
     NodeRole,
     NodeStatus,
@@ -51,6 +56,83 @@ if TYPE_CHECKING:
     from aion.distributed.cluster.manager import ClusterManager
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Persistent State Storage
+# ---------------------------------------------------------------------------
+
+
+class RaftPersistentState:
+    """Durable storage for Raft safety-critical state.
+
+    The Raft protocol requires that ``currentTerm`` and ``votedFor`` survive
+    crashes.  Without durability a restarted node could vote twice in the
+    same term, violating Election Safety (§5.2).
+
+    This implementation uses a simple JSON file with atomic writes (write
+    to a temp file then rename).  Production systems would use RocksDB,
+    SQLite-WAL, or similar.
+    """
+
+    def __init__(self, data_dir: Optional[str] = None) -> None:
+        if data_dir:
+            self._path = Path(data_dir) / "raft_state.json"
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._path = None
+        self._current_term: int = 0
+        self._voted_for: Optional[str] = None
+        self._load()
+
+    def _load(self) -> None:
+        """Load persisted state from disk."""
+        if self._path is None or not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text())
+            self._current_term = data.get("current_term", 0)
+            self._voted_for = data.get("voted_for")
+        except Exception:
+            pass  # Start fresh on corruption
+
+    def _flush(self) -> None:
+        """Atomically persist state to disk."""
+        if self._path is None:
+            return
+        tmp = self._path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps({
+                "current_term": self._current_term,
+                "voted_for": self._voted_for,
+            }))
+            tmp.rename(self._path)
+        except Exception:
+            pass  # Best-effort; production would retry or crash
+
+    @property
+    def current_term(self) -> int:
+        return self._current_term
+
+    @current_term.setter
+    def current_term(self, value: int) -> None:
+        self._current_term = value
+        self._flush()
+
+    @property
+    def voted_for(self) -> Optional[str]:
+        return self._voted_for
+
+    @voted_for.setter
+    def voted_for(self, value: Optional[str]) -> None:
+        self._voted_for = value
+        self._flush()
+
+    def update(self, term: int, voted_for: Optional[str]) -> None:
+        """Batch update both fields with a single flush."""
+        self._current_term = term
+        self._voted_for = voted_for
+        self._flush()
 
 
 class RaftConsensus:
@@ -85,6 +167,7 @@ class RaftConsensus:
         self,
         node_info: NodeInfo,
         cluster_manager: "ClusterManager",
+        data_dir: Optional[str] = None,
     ) -> None:
         self._log = logger.bind(
             component="raft_consensus",
@@ -95,9 +178,11 @@ class RaftConsensus:
         self._node_info = node_info
         self._cluster_manager = cluster_manager
 
-        # Persistent state (on all servers)
-        self._current_term: int = 0
-        self._voted_for: Optional[str] = None
+        # Persistent state (on all servers) -- survives crashes
+        self._persistent = RaftPersistentState(data_dir)
+
+        # Snapshot data cache (for InstallSnapshot to followers)
+        self._last_snapshot_data: Optional[bytes] = None
 
         # Volatile state (on all servers)
         self._commit_index: int = -1
@@ -146,13 +231,33 @@ class RaftConsensus:
         self._step_downs: int = 0
 
     # =========================================================================
+    # Persistent state accessors (delegate to RaftPersistentState)
+    # =========================================================================
+
+    @property
+    def _current_term(self) -> int:
+        return self._persistent.current_term
+
+    @_current_term.setter
+    def _current_term(self, value: int) -> None:
+        self._persistent.current_term = value
+
+    @property
+    def _voted_for(self) -> Optional[str]:
+        return self._persistent.voted_for
+
+    @_voted_for.setter
+    def _voted_for(self, value: Optional[str]) -> None:
+        self._persistent.voted_for = value
+
+    # =========================================================================
     # Properties
     # =========================================================================
 
     @property
     def current_term(self) -> int:
         """The current Raft term of this node."""
-        return self._current_term
+        return self._persistent.current_term
 
     @property
     def role(self) -> NodeRole:
@@ -290,8 +395,8 @@ class RaftConsensus:
         if term > self._current_term:
             old_term = self._current_term
             old_role = self._role
-            self._current_term = term
-            self._voted_for = None
+            # Batch-persist both fields in a single flush
+            self._persistent.update(term, None)
             self._step_down_to_follower()
             self._step_downs += 1
 
@@ -760,7 +865,6 @@ class RaftConsensus:
                     # Append remaining entries
                     remaining = entries[i:]
                     for rem_entry in remaining:
-                        rem_entry.term = rem_entry.term  # preserve
                         await self._replicated_log.append(rem_entry)
                     return
                 # Same term: entry already exists, skip
@@ -854,7 +958,7 @@ class RaftConsensus:
         peers = self._get_peer_ids()
         if not peers:
             # Single-node cluster: advance commit index directly
-            self._advance_commit_index()
+            await self._advance_commit_index()
             return
 
         tasks = []
@@ -863,7 +967,7 @@ class RaftConsensus:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-            self._advance_commit_index()
+            await self._advance_commit_index()
 
     async def _send_append_entries_to_peer(self, peer_id: str) -> None:
         """
@@ -872,8 +976,19 @@ class RaftConsensus:
         Constructs the request based on the peer's next_index,
         sends it, and processes the response (updating next_index
         and match_index).
+
+        If the peer's next_index has been compacted away (behind the
+        snapshot boundary), an InstallSnapshot RPC is sent instead.
         """
         next_idx = self._next_index.get(peer_id, 0)
+
+        # If the follower needs entries we've already compacted,
+        # send a snapshot instead (§7 of the Raft paper).
+        snapshot_index = self._replicated_log.snapshot_index
+        if snapshot_index >= 0 and next_idx <= snapshot_index:
+            await self._send_install_snapshot_to_peer(peer_id)
+            return
+
         prev_log_index = next_idx - 1
         prev_log_term = self._replicated_log.get_term_at(prev_log_index)
 
@@ -954,7 +1069,7 @@ class RaftConsensus:
                 new_next_index=self._next_index[peer_id],
             )
 
-    def _advance_commit_index(self) -> None:
+    async def _advance_commit_index(self) -> None:
         """
         Advance the commit index based on match_index values.
 
@@ -962,43 +1077,47 @@ class RaftConsensus:
         majority of nodes AND it was created in the leader's current
         term (Raft safety: leaders only commit entries from their
         own term; previous-term entries are committed indirectly).
+
+        This method must be called under ``self._lock`` or from a
+        context that already holds exclusive access to the mutable state.
         """
-        if self._role != NodeRole.LEADER:
-            return
+        async with self._lock:
+            if self._role != NodeRole.LEADER:
+                return
 
-        peers = self._get_peer_ids()
-        cluster_size = len(peers) + 1  # Include self
+            peers = self._get_peer_ids()
+            cluster_size = len(peers) + 1  # Include self
 
-        # Collect all match indices (leader's own match is last_log_index)
-        match_indices = [self._replicated_log.get_last_index()]
-        for peer_id in peers:
-            match_indices.append(self._match_index.get(peer_id, -1))
+            # Collect all match indices (leader's own match is last_log_index)
+            match_indices = [self._replicated_log.get_last_index()]
+            for peer_id in peers:
+                match_indices.append(self._match_index.get(peer_id, -1))
 
-        # Sort descending and find the median (quorum position)
-        match_indices.sort(reverse=True)
-        quorum_pos = cluster_size // 2  # Majority position (0-indexed)
+            # Sort descending and find the median (quorum position)
+            match_indices.sort(reverse=True)
+            quorum_pos = cluster_size // 2  # Majority position (0-indexed)
 
-        if quorum_pos < len(match_indices):
-            potential_commit = match_indices[quorum_pos]
-        else:
-            return
+            if quorum_pos < len(match_indices):
+                potential_commit = match_indices[quorum_pos]
+            else:
+                return
 
-        # Only commit entries from the current term (Raft safety)
-        if potential_commit > self._commit_index:
-            entry = self._replicated_log.get(potential_commit)
-            if entry is not None and entry.term == self._current_term:
-                old_commit = self._commit_index
-                self._commit_index = potential_commit
+            # Only commit entries from the current term (Raft safety)
+            if potential_commit > self._commit_index:
+                entry = self._replicated_log.get(potential_commit)
+                if entry is not None and entry.term == self._current_term:
+                    old_commit = self._commit_index
+                    self._commit_index = potential_commit
 
-                self._log.debug(
-                    "commit_index_advanced",
-                    old=old_commit,
-                    new=self._commit_index,
-                    match_indices=match_indices,
-                )
+                    self._log.debug(
+                        "commit_index_advanced",
+                        old=old_commit,
+                        new=self._commit_index,
+                        match_indices=match_indices,
+                    )
 
-                # Resolve pending command futures
-                self._resolve_pending_commands()
+                    # Resolve pending command futures
+                    self._resolve_pending_commands()
 
     def _resolve_pending_commands(self) -> None:
         """Resolve futures for committed commands."""
@@ -1231,7 +1350,157 @@ class RaftConsensus:
             last_included_term=metadata.last_included_term,
             size_bytes=metadata.size_bytes,
         )
+
+        # Cache snapshot data for InstallSnapshot RPCs
+        self._last_snapshot_data = snapshot_data
         return metadata
+
+    # =========================================================================
+    # InstallSnapshot RPC (Receiver / Follower)
+    # =========================================================================
+
+    async def handle_install_snapshot(
+        self, request: InstallSnapshotRequest
+    ) -> InstallSnapshotResponse:
+        """Handle an InstallSnapshot RPC from the leader.
+
+        When a follower's log is too far behind and the leader has
+        compacted the entries it needs, the leader sends a snapshot
+        instead of individual log entries.  The follower replaces its
+        state machine with the snapshot and resets its log.
+
+        Implements §7 of the Raft paper.
+
+        Args:
+            request: The incoming InstallSnapshot request.
+
+        Returns:
+            An InstallSnapshotResponse with the current term.
+        """
+        async with self._lock:
+            response = InstallSnapshotResponse(
+                term=self._current_term,
+            )
+
+            # Step down if higher term
+            if self._discover_higher_term(request.term, source="install_snapshot"):
+                response.term = self._current_term
+
+            # Stale term — reject
+            if request.term < self._current_term:
+                self._log.debug(
+                    "install_snapshot_denied_stale_term",
+                    leader_term=request.term,
+                    our_term=self._current_term,
+                )
+                return response
+
+            # Valid leader — reset election timer
+            self._election.reset_timeout()
+            self._leader_id = request.leader_id
+
+            if self._role != NodeRole.FOLLOWER:
+                self._step_down_to_follower()
+
+            # If this snapshot is not newer than what we have, ignore
+            if request.last_included_index <= self._replicated_log.snapshot_index:
+                self._log.debug(
+                    "install_snapshot_stale",
+                    request_index=request.last_included_index,
+                    our_snapshot_index=self._replicated_log.snapshot_index,
+                )
+                return response
+
+            # Install the snapshot into the state machine
+            await self._state_machine.restore_snapshot(request.data)
+
+            # Reset the log to the snapshot boundary
+            await self._replicated_log.reset_to_snapshot(
+                request.last_included_index,
+                request.last_included_term,
+            )
+
+            # Update volatile state
+            self._commit_index = max(self._commit_index, request.last_included_index)
+            self._last_applied = request.last_included_index
+
+            self._log.info(
+                "snapshot_installed",
+                last_included_index=request.last_included_index,
+                last_included_term=request.last_included_term,
+                data_bytes=len(request.data) if request.data else 0,
+            )
+
+            return response
+
+    async def _send_install_snapshot_to_peer(self, peer_id: str) -> None:
+        """Send an InstallSnapshot RPC to a peer that is behind the snapshot.
+
+        Called by the leader when a follower's next_index is at or before
+        the snapshot boundary and the required log entries have been
+        compacted away.
+        """
+        snapshot_index = self._replicated_log.snapshot_index
+        snapshot_term = self._replicated_log.snapshot_term
+
+        if snapshot_index < 0:
+            return  # No snapshot to send
+
+        # Get snapshot data (take one if we don't have cached data)
+        snapshot_data = self._last_snapshot_data
+        if snapshot_data is None:
+            snapshot_data = await self._state_machine.take_snapshot()
+            self._last_snapshot_data = snapshot_data
+
+        request = InstallSnapshotRequest(
+            term=self._current_term,
+            leader_id=self._node_info.id,
+            last_included_index=snapshot_index,
+            last_included_term=snapshot_term,
+            data=snapshot_data,
+        )
+
+        self._log.info(
+            "sending_install_snapshot",
+            peer=peer_id,
+            snapshot_index=snapshot_index,
+            snapshot_term=snapshot_term,
+        )
+
+        try:
+            response = await self._send_install_snapshot_rpc(peer_id, request)
+            if response is not None:
+                if self._discover_higher_term(
+                    response.term, source=f"install_snap_resp_{peer_id}"
+                ):
+                    return
+                # On success, advance next_index past the snapshot
+                self._next_index[peer_id] = snapshot_index + 1
+                self._match_index[peer_id] = snapshot_index
+                self._log.info(
+                    "install_snapshot_sent",
+                    peer=peer_id,
+                    new_next_index=snapshot_index + 1,
+                )
+        except Exception as exc:
+            self._log.warning(
+                "install_snapshot_failed",
+                peer=peer_id,
+                error=str(exc),
+            )
+
+    async def _send_install_snapshot_rpc(
+        self, peer_id: str, request: InstallSnapshotRequest
+    ) -> Optional[InstallSnapshotResponse]:
+        """Send an InstallSnapshot RPC via the cluster manager transport."""
+        try:
+            if hasattr(self._cluster_manager, "send_install_snapshot"):
+                return await self._cluster_manager.send_install_snapshot(
+                    peer_id, request
+                )
+        except Exception as exc:
+            self._log.debug("rpc_install_snapshot_failed", peer=peer_id, error=str(exc))
+        return None
 
     # =========================================================================
     # Statistics and Diagnostics

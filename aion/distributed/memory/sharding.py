@@ -415,25 +415,111 @@ class MemoryShardManager:
         except Exception:
             return []
 
+    def _is_local_node(self, node_id: str) -> bool:
+        """Check if *node_id* is the local node."""
+        try:
+            return node_id == self._cluster.local_node.id
+        except Exception:
+            return True  # Fallback to local if unknown
+
+    def _get_node_address(self, node_id: str) -> Optional[str]:
+        """Resolve a node ID to its network address."""
+        try:
+            state = self._cluster.state
+            node = state.nodes.get(node_id)
+            if node is not None:
+                return node.address
+        except Exception:
+            pass
+        return None
+
     async def _write_to_node(
         self, node_id: str, key: str, value: Any, clock: VectorClock
     ) -> bool:
-        """Write to a single node (local fast path or remote RPC stub)."""
-        # In a production deployment this would perform an RPC; for now
-        # we simulate with the local store.
-        self._local_store[key] = value
-        return True
+        """Write to a single node (local fast path or remote RPC).
+
+        If *node_id* is the local node, writes directly to the local
+        store.  Otherwise, delegates to the RPC client's ``shard_write``.
+        """
+        if self._is_local_node(node_id):
+            self._local_store[key] = value
+            return True
+
+        rpc_client = getattr(self._cluster, "_rpc_client", None)
+        address = self._get_node_address(node_id)
+        if rpc_client is None or address is None:
+            logger.warning(
+                "shard_manager.write_to_node.no_rpc",
+                node_id=node_id,
+                key=key,
+            )
+            return False
+
+        try:
+            clock_dict = clock.clock if hasattr(clock, "clock") else {}
+            result = await rpc_client.shard_write(
+                address, key, value, vector_clock=clock_dict,
+            )
+            return result is not None
+        except Exception as exc:
+            logger.warning(
+                "shard_manager.write_to_node.failed",
+                node_id=node_id,
+                key=key,
+                error=str(exc),
+            )
+            return False
 
     async def _read_from_node(self, node_id: str, key: str) -> Optional[Any]:
-        """Read from a single node."""
-        return self._local_store.get(key)
+        """Read from a single node (local fast path or remote RPC)."""
+        if self._is_local_node(node_id):
+            return self._local_store.get(key)
+
+        rpc_client = getattr(self._cluster, "_rpc_client", None)
+        address = self._get_node_address(node_id)
+        if rpc_client is None or address is None:
+            logger.warning(
+                "shard_manager.read_from_node.no_rpc",
+                node_id=node_id,
+                key=key,
+            )
+            return None
+
+        try:
+            return await rpc_client.shard_read(address, key)
+        except Exception as exc:
+            logger.warning(
+                "shard_manager.read_from_node.failed",
+                node_id=node_id,
+                key=key,
+                error=str(exc),
+            )
+            return None
 
     async def _delete_from_node(self, node_id: str, key: str) -> bool:
-        """Delete from a single node."""
-        if key in self._local_store:
-            del self._local_store[key]
-            return True
-        return False
+        """Delete from a single node (local fast path or remote RPC)."""
+        if self._is_local_node(node_id):
+            if key in self._local_store:
+                del self._local_store[key]
+                return True
+            return False
+
+        rpc_client = getattr(self._cluster, "_rpc_client", None)
+        address = self._get_node_address(node_id)
+        if rpc_client is None or address is None:
+            return False
+
+        try:
+            result = await rpc_client.shard_delete(address, key)
+            return result is not None
+        except Exception as exc:
+            logger.warning(
+                "shard_manager.delete_from_node.failed",
+                node_id=node_id,
+                key=key,
+                error=str(exc),
+            )
+            return False
 
     # -- stats ------------------------------------------------------------
 

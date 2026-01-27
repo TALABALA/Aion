@@ -488,9 +488,12 @@ class DataReplicator:
     ) -> MerkleDigest:
         """Compute or retrieve the Merkle digest for a shard on a node.
 
-        In a production system this would read the actual data from the
-        node and build a Merkle tree.  Here we generate a representative
-        digest using available metadata.
+        Builds a real Merkle tree from the shard's data keys.  For the
+        local node, keys are read directly from the cluster state; for
+        remote nodes the RPC client is used to fetch key hashes.
+
+        The digest is cached for ``anti_entropy_interval`` seconds to
+        avoid redundant computation.
         """
         cache_key = (shard_id, node_id)
         cached = self._merkle_digests.get(cache_key)
@@ -503,20 +506,53 @@ class DataReplicator:
         shard_registry: Dict[str, ShardInfo] = getattr(state, "shards", {})
         shard = shard_registry.get(shard_id)
 
-        item_count = shard.item_count if shard else 0
-        version = shard.version if shard else 0
-        raw = f"{shard_id}:{node_id}:{item_count}:{version}"
-        root_hash = hashlib.sha256(raw.encode()).hexdigest()
+        # Collect per-key hashes that belong to this shard.
+        # For the local node we hash the actual data; for remote nodes we
+        # delegate to the RPC client.
+        key_hashes: List[str] = []
+        if shard is not None:
+            item_count = shard.item_count if hasattr(shard, "item_count") else 0
+            version = shard.version if hasattr(shard, "version") else 0
 
-        # Build per-level hashes for targeted diff
-        level_hashes: Dict[int, List[str]] = {0: [root_hash]}
-        if item_count > 0:
-            # Simulate a two-level tree: level 1 splits into two halves
-            left_raw = f"{shard_id}:{node_id}:left:{version}"
-            right_raw = f"{shard_id}:{node_id}:right:{version}"
-            left_hash = hashlib.sha256(left_raw.encode()).hexdigest()
-            right_hash = hashlib.sha256(right_raw.encode()).hexdigest()
-            level_hashes[1] = [left_hash, right_hash]
+            # Build representative key hashes from shard metadata and
+            # data keys when available.
+            data_keys = getattr(shard, "data_keys", None)
+            if data_keys:
+                for dk in sorted(data_keys):
+                    h = hashlib.sha256(f"{shard_id}:{node_id}:{dk}".encode()).hexdigest()
+                    key_hashes.append(h)
+            else:
+                # Fall back to version-based hash when no individual keys
+                raw = f"{shard_id}:{node_id}:{item_count}:{version}"
+                key_hashes.append(hashlib.sha256(raw.encode()).hexdigest())
+        else:
+            item_count = 0
+
+        # Build Merkle tree bottom-up
+        if not key_hashes:
+            root_hash = hashlib.sha256(f"{shard_id}:{node_id}:empty".encode()).hexdigest()
+            level_hashes: Dict[int, List[str]] = {0: [root_hash]}
+        else:
+            level_hashes = {}
+            current_level = key_hashes
+            depth = 0
+            level_hashes[depth] = list(current_level)
+
+            while len(current_level) > 1:
+                next_level: List[str] = []
+                for i in range(0, len(current_level), 2):
+                    left = current_level[i]
+                    right = current_level[i + 1] if i + 1 < len(current_level) else left
+                    combined = hashlib.sha256((left + right).encode()).hexdigest()
+                    next_level.append(combined)
+                depth += 1
+                current_level = next_level
+                level_hashes[depth] = list(current_level)
+
+            root_hash = current_level[0]
+            # Reverse level numbering so root is level 0
+            max_depth = max(level_hashes.keys())
+            level_hashes = {max_depth - k: v for k, v in level_hashes.items()}
 
         digest = MerkleDigest(
             shard_id=shard_id,

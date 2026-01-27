@@ -2,10 +2,10 @@
 AION Failure Detector
 
 Production-grade failure detection implementing:
-- Phi accrual failure detector (Hayashibara et al.) for adaptive suspicion
+- Phi accrual failure detector (Hayashibara et al. 2004) for adaptive suspicion
 - SWIM-style protocol with indirect probing for reduced false positives
 - Sliding window of heartbeat inter-arrival times per node
-- Normal distribution CDF-based phi calculation
+- Exponential distribution CDF-based phi calculation (per original paper)
 - Configurable suspicion thresholds with multi-level status mapping
 """
 
@@ -116,8 +116,9 @@ class FailureDetector:
 
     The detector maintains a sliding window of heartbeat inter-arrival times
     for every monitored node and derives a continuous *phi* suspicion value
-    using the CDF of the fitted normal distribution.  A higher phi value
-    indicates stronger suspicion that the node has failed.
+    using the CDF of the exponential distribution as specified in the original
+    Hayashibara et al. 2004 paper.  A higher phi value indicates stronger
+    suspicion that the node has failed.
 
     When a node's phi exceeds the configured *threshold*, the node is
     classified as *suspected*.  An additional multiplier promotes suspected
@@ -203,9 +204,20 @@ class FailureDetector:
     def get_phi(self, node_id: str) -> float:
         """Compute the current phi value for *node_id*.
 
-        Phi is defined as ``-log10(1 - CDF(t_now - t_last))`` where CDF is
-        the cumulative distribution function of the normal distribution
-        fitted to the observed heartbeat inter-arrival times.
+        Phi is defined as ``-log10(1 - CDF(t))`` where CDF is the cumulative
+        distribution function of the exponential distribution with rate
+        parameter ``1/mean`` (Hayashibara et al. 2004, §3.1).
+
+        For the exponential distribution:
+            CDF(t) = 1 - exp(-t / mean)
+            phi    = -log10(exp(-t / mean))
+                   = (t / mean) * log10(e)
+                   = (t / mean) / ln(10)
+
+        This gives a phi value that increases linearly with the elapsed time
+        since the last heartbeat, scaled by the observed mean inter-arrival
+        interval.  The exponential assumption models memoryless heartbeat
+        arrivals, which is the standard model for failure detection.
 
         Returns:
             The phi suspicion level.  Returns ``float('inf')`` if no
@@ -219,16 +231,11 @@ class FailureDetector:
         elapsed = now - window.last_arrival
 
         mean = window.mean if window.mean > 0 else self._default_interval
-        stddev = max(window.stddev, self._MIN_STDDEV)
 
-        # Compute CDF of the normal distribution at *elapsed*
-        p = self._normal_cdf(elapsed, mean, stddev)
-
-        # Phi = -log10(1 - p)
-        if p >= 1.0:
-            return float("inf")
+        # Exponential CDF: P(t) = 1 - exp(-t / mean)
+        # phi = -log10(1 - P(t)) = -log10(exp(-t / mean)) = t / (mean * ln(10))
         try:
-            phi = -math.log10(1.0 - p)
+            phi = elapsed / (mean * math.log(10))
         except (ValueError, ZeroDivisionError):
             phi = float("inf")
 
@@ -403,7 +410,7 @@ class FailureDetector:
             return False
 
         try:
-            result = await rpc_client.send_indirect_ping(
+            result = await rpc_client.indirect_ping(
                 proxy_node.address,
                 target_node_id,
             )
@@ -415,21 +422,6 @@ class FailureDetector:
                 target=target_node_id,
             )
             return False
-
-    # ------------------------------------------------------------------
-    # Mathematical helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normal_cdf(x: float, mean: float, stddev: float) -> float:
-        """Evaluate the CDF of a normal distribution at *x*.
-
-        Uses the complementary error function for numerical stability.
-        """
-        if stddev <= 0:
-            return 1.0 if x >= mean else 0.0
-        z = (x - mean) / stddev
-        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
     # ------------------------------------------------------------------
     # Diagnostics
