@@ -308,7 +308,10 @@ class TestExperienceBuffer:
         for _ in range(5):
             buf.add(Experience())
         buf.update_priorities([0, 1, 2], np.array([0.1, 0.5, 1.0]))
-        assert buf._priorities[2] > buf._priorities[0]
+        # Verify via the sum-tree: higher TD error → higher priority
+        p0 = buf._sampler._tree[0 + buf._sampler.capacity]
+        p2 = buf._sampler._tree[2 + buf._sampler.capacity]
+        assert p2 > p0
 
     def test_get_stats(self):
         buf = ExperienceBuffer()

@@ -24,6 +24,8 @@ class RewardConfig:
     normalisation_window: int = 1000
     discount_gamma: float = 0.99
     delay_penalty_per_minute: float = 0.01
+    use_ema_normalisation: bool = True
+    ema_decay: float = 0.99  # EMA smoothing factor for non-stationary rewards
 
 
 @dataclass

@@ -44,14 +44,14 @@ class ToolSelectionPolicy(BasePolicy):
                 score = stats.get("avg_reward", 0.0)
             scores[tool] = score
 
-        # Softmax with temperature
+        # Softmax with temperature — sample from the distribution
         vals = np.array(list(scores.values()))
         temp = max(0.01, self.config.exploration_rate)
         exp_vals = np.exp((vals - np.max(vals)) / temp)
         probs = exp_vals / exp_vals.sum()
 
-        best_idx = int(np.argmax(probs))
-        return available_actions[best_idx], float(probs[best_idx])
+        idx = int(np.random.choice(len(available_actions), p=probs))
+        return available_actions[idx], float(probs[idx])
 
     async def update(
         self,

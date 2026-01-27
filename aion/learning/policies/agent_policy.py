@@ -46,18 +46,19 @@ class AgentBehaviorPolicy(BasePolicy):
             else:
                 scores[behavior] = self._behavior_values.get(behavior, 0.0)
 
+        # Entropy-regularised softmax (SAC-style):
+        # π(a|s) ∝ exp((Q(s,a) + τ·H) / τ) where τ = entropy_coefficient
+        # Adding entropy bonus to scores before softmax is equivalent to
+        # raising the temperature, encouraging exploration of uncertain actions.
         vals = np.array(list(scores.values()))
-        exp_vals = np.exp(vals - np.max(vals))
-        probs = exp_vals / exp_vals.sum()
+        tau = max(0.01, self.config.entropy_coefficient)
+        log_probs = (vals - np.max(vals)) / tau
+        probs = np.exp(log_probs)
+        probs /= probs.sum()
 
-        # Entropy-regularised selection
-        entropy = -np.sum(probs * np.log(probs + 1e-10))
-        probs_with_entropy = probs + self.config.entropy_coefficient * (1.0 / len(probs) - probs)
-        probs_with_entropy = np.clip(probs_with_entropy, 0, None)
-        probs_with_entropy /= probs_with_entropy.sum()
-
-        best_idx = int(np.argmax(probs_with_entropy))
-        return available_actions[best_idx], float(probs_with_entropy[best_idx])
+        # Sample from the entropy-regularised distribution
+        idx = int(np.random.choice(len(available_actions), p=probs))
+        return available_actions[idx], float(probs[idx])
 
     async def update(
         self,

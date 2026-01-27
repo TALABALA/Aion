@@ -230,18 +230,24 @@ class ArmStatistics:
     last_pulled: Optional[datetime] = None
 
     def update(self, reward: float) -> None:
-        """Online update of arm statistics (Welford's algorithm for variance)."""
+        """Online update of arm statistics (Welford's algorithm for variance).
+
+        Beta posterior uses proper Bernoulli conjugate update:
+        rewards are thresholded at 0.5 for binary success/failure.
+        The continuous reward is still tracked in avg_reward/variance.
+        """
         self.pulls += 1
         self.total_reward += reward
         delta = reward - self.avg_reward
         self.avg_reward += delta / self.pulls
         delta2 = reward - self.avg_reward
         self.reward_variance += delta * delta2
-        # Beta-distribution posterior update
-        if reward > 0:
-            self.alpha += reward
+        # Beta-distribution posterior: Bernoulli conjugate update
+        # Threshold reward at 0.5 for binary success/failure
+        if reward >= 0.5:
+            self.alpha += 1.0
         else:
-            self.beta += abs(reward)
+            self.beta += 1.0
         self.last_pulled = datetime.now()
 
     @property

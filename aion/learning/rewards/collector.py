@@ -258,17 +258,34 @@ class RewardCollector:
         )
 
     # ------------------------------------------------------------------
-    # Online normalisation (Welford's algorithm)
+    # Online normalisation
     # ------------------------------------------------------------------
 
     def _update_normalisation(self, reward: float) -> None:
         self._reward_count += 1
-        delta = reward - self._reward_mean
-        self._reward_mean += delta / self._reward_count
-        delta2 = reward - self._reward_mean
-        self._reward_m2 += delta * delta2
-        if self._reward_count > 10:
-            self._reward_std = max(np.sqrt(self._reward_m2 / self._reward_count), 0.01)
+        if self._config.use_ema_normalisation:
+            # Exponentially-weighted moving average — adapts to
+            # non-stationary reward distributions (user preferences shift)
+            alpha = 1.0 - self._config.ema_decay
+            if self._reward_count == 1:
+                self._reward_mean = reward
+                self._reward_m2 = 0.0
+            else:
+                delta = reward - self._reward_mean
+                self._reward_mean += alpha * delta
+                self._reward_m2 = (
+                    self._config.ema_decay * (self._reward_m2 + alpha * delta * delta)
+                )
+            if self._reward_count > 10:
+                self._reward_std = max(np.sqrt(self._reward_m2), 0.01)
+        else:
+            # Welford's algorithm — equal weight to all history (stationary)
+            delta = reward - self._reward_mean
+            self._reward_mean += delta / self._reward_count
+            delta2 = reward - self._reward_mean
+            self._reward_m2 += delta * delta2
+            if self._reward_count > 10:
+                self._reward_std = max(np.sqrt(self._reward_m2 / self._reward_count), 0.01)
 
     def _normalise_reward(self, reward: float) -> float:
         if self._reward_std > 0:

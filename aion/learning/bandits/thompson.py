@@ -126,7 +126,8 @@ class ContextualThompsonSampling:
     def add_arm(self, arm_id: str) -> None:
         if arm_id not in self._arms:
             self._arms[arm_id] = {
-                "B": self.prior_variance * np.eye(self.feature_dim),
+                "B": (1.0 / self.prior_variance) * np.eye(self.feature_dim),
+                "B_inv": self.prior_variance * np.eye(self.feature_dim),
                 "mu": np.zeros(self.feature_dim),
                 "f": np.zeros(self.feature_dim),
                 "pulls": 0,
@@ -143,7 +144,10 @@ class ContextualThompsonSampling:
         context: np.ndarray,
         available_arms: Optional[List[str]] = None,
     ) -> str:
-        """Select arm by sampling weights from posterior."""
+        """Select arm by sampling weights from posterior.
+
+        Uses pre-maintained B_inv for O(d^2) per arm instead of O(d^3).
+        """
         arms = available_arms or list(self._arms.keys())
         if not arms:
             raise ValueError("No arms available")
@@ -155,8 +159,7 @@ class ContextualThompsonSampling:
             self.add_arm(arm_id)
             arm = self._arms[arm_id]
             try:
-                B_inv = np.linalg.inv(arm["B"])
-                theta = np.random.multivariate_normal(arm["mu"], B_inv)
+                theta = np.random.multivariate_normal(arm["mu"], arm["B_inv"])
             except np.linalg.LinAlgError:
                 theta = arm["mu"]
             samples[arm_id] = float(np.dot(ctx, theta))
@@ -164,17 +167,26 @@ class ContextualThompsonSampling:
         return max(samples, key=samples.get)  # type: ignore[arg-type]
 
     def update(self, arm_id: str, context: np.ndarray, reward: float) -> None:
-        """Bayesian update of the linear model for this arm."""
+        """Bayesian update of the linear model for this arm.
+
+        Uses Sherman-Morrison formula to maintain B_inv in O(d^2)
+        instead of recomputing via O(d^3) matrix inversion.
+        """
         self.add_arm(arm_id)
         arm = self._arms[arm_id]
         ctx = self._pad_context(context)
 
-        arm["B"] += np.outer(ctx, ctx) / self.noise_variance
+        outer = np.outer(ctx, ctx) / self.noise_variance
+        arm["B"] += outer
         arm["f"] += reward * ctx / self.noise_variance
-        try:
-            arm["mu"] = np.linalg.solve(arm["B"], arm["f"])
-        except np.linalg.LinAlgError:
-            pass
+
+        # Sherman-Morrison update for B_inv: (A + uv^T)^{-1}
+        B_inv = arm["B_inv"]
+        Bx = B_inv @ ctx
+        denom = self.noise_variance + float(ctx @ Bx)
+        arm["B_inv"] = B_inv - np.outer(Bx, Bx) / denom
+
+        arm["mu"] = arm["B_inv"] @ arm["f"]
         arm["pulls"] += 1
 
     def get_expected_reward(self, arm_id: str, context: np.ndarray) -> float:

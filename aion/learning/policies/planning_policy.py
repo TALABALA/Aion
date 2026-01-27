@@ -53,8 +53,8 @@ class PlanningStrategyPolicy(BasePolicy):
         exp_vals = np.exp(vals - np.max(vals))
         probs = exp_vals / exp_vals.sum()
 
-        best_idx = int(np.argmax(probs))
-        return available_actions[best_idx], float(probs[best_idx])
+        idx = int(np.random.choice(len(available_actions), p=probs))
+        return available_actions[idx], float(probs[idx])
 
     async def update(
         self,
