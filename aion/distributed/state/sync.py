@@ -113,6 +113,9 @@ class StateSynchronizer:
         self._state_versions: Dict[str, VectorClock] = {}
         self._state_timestamps: Dict[str, float] = {}
 
+        # Remote vector clocks received during pull (node_id -> {key -> clock_dict})
+        self._remote_clocks: Dict[str, Dict[str, Any]] = {}
+
         # Sync tracking
         self._sync_progress: Dict[str, SyncProgress] = {}
         self._running = False
@@ -442,7 +445,14 @@ class StateSynchronizer:
             return ""
 
     async def _fetch_remote_state(self, node_id: str) -> Dict[str, Any]:
-        """Fetch the full state from a remote node via RPC."""
+        """Fetch the full state from a remote node via RPC.
+
+        The response is expected to be a dict mapping keys to values.  If the
+        remote side also provides vector clocks (under the special key
+        ``__vector_clocks__``), they are extracted and stored in
+        ``_remote_clocks`` so that ``_is_remote_newer`` can compare them
+        against local clocks.
+        """
         rpc = self._get_rpc_client()
         address = self._get_node_address(node_id)
         if rpc is None or address is None:
@@ -454,7 +464,15 @@ class StateSynchronizer:
 
         try:
             result = await rpc.fetch_remote_state(address)
-            return result if result is not None else {}
+            if result is None:
+                return {}
+
+            # Extract and cache remote vector clocks if provided
+            remote_clocks = result.pop("__vector_clocks__", None)
+            if isinstance(remote_clocks, dict):
+                self._remote_clocks[node_id] = remote_clocks
+
+            return result
         except Exception as exc:
             logger.warning(
                 "state_synchronizer.fetch_remote_state.failed",
@@ -545,16 +563,42 @@ class StateSynchronizer:
 
         Uses vector clock comparison when available.  If the local key
         has no associated vector clock, the remote version is assumed newer.
+        When clocks are concurrent (true conflict), the remote is also
+        accepted to ensure convergence via a conservative merge strategy.
         """
         local_clock = self._state_versions.get(key)
         if local_clock is None:
+            # No local version info — accept remote
             return True
 
-        # If we have a local clock but no remote clock info, assume
-        # the remote could be newer (conservative merge strategy).
-        # In a full implementation the remote clock would be fetched
-        # alongside the remote state in _fetch_remote_state.
-        return False
+        # Try to compare against the remote vector clock if we have one
+        remote_node_clocks = self._remote_clocks.get(node_id, {})
+        remote_clock_data = remote_node_clocks.get(key)
+
+        if remote_clock_data is not None:
+            # Reconstruct a VectorClock from the remote data
+            remote_clock = VectorClock()
+            if isinstance(remote_clock_data, dict):
+                for nid, counter in remote_clock_data.items():
+                    remote_clock.clock[nid] = int(counter)
+            elif isinstance(remote_clock_data, VectorClock):
+                remote_clock = remote_clock_data
+
+            # If remote dominates local -> remote is newer
+            if remote_clock.dominates(local_clock):
+                return True
+            # If local dominates remote -> local is newer
+            if local_clock.dominates(remote_clock):
+                return False
+            # Concurrent: accept remote to ensure convergence
+            # (both sides accept each other's writes; last-merge-wins)
+            return True
+
+        # No remote clock available — use conservative merge strategy:
+        # accept remote writes so that data is not silently lost.
+        # Worst case: a stale value overwrites a newer one, which the
+        # next anti-entropy round will repair.
+        return True
 
     def _get_or_create_progress(self, node_id: str) -> SyncProgress:
         if node_id not in self._sync_progress:

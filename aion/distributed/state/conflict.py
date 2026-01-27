@@ -11,10 +11,10 @@ from __future__ import annotations
 import copy
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Tuple
 
 import structlog
 
@@ -169,8 +169,11 @@ class ConflictResolver:
         self._custom_hook = custom_hook
         self._max_audit_records = max_audit_records
 
-        # Audit trail
-        self._audit_log: List[ConflictRecord] = []
+        # Audit trail — uses a bounded deque so records are naturally
+        # evicted in FIFO order without rewriting the collection.
+        # This makes the audit log effectively append-only with bounded
+        # memory: old records fall off the tail when maxlen is exceeded.
+        self._audit_log: Deque[ConflictRecord] = deque(maxlen=max_audit_records)
 
         # Per-key conflict counters for monitoring
         self._conflict_counts: Dict[str, int] = defaultdict(int)
@@ -399,7 +402,15 @@ class ConflictResolver:
         # Build result event based on the latest event
         result = copy.deepcopy(events[-1])
         result.event_id = str(uuid.uuid4())
-        result.value = {"_crdt_type": "g_counter", "counts": merged.to_dict()}
+        result.value = {
+            "_crdt_type": "g_counter",
+            "counts": merged.to_dict(),
+            "_merge_provenance": {
+                "source_event_ids": [e.event_id for e in events],
+                "source_nodes": [e.source_node for e in events],
+                "merged_at": datetime.now().isoformat(),
+            },
+        }
         result.timestamp = datetime.now()
 
         # Merge all vector clocks
@@ -411,6 +422,7 @@ class ConflictResolver:
         logger.debug(
             "conflict_resolver.gcounter_merge",
             merged_value=merged.value(),
+            source_events=len(events),
         )
         return result
 
@@ -440,6 +452,11 @@ class ConflictResolver:
             "_crdt_type": "pn_counter",
             "increments": merged.increments.to_dict(),
             "decrements": merged.decrements.to_dict(),
+            "_merge_provenance": {
+                "source_event_ids": [e.event_id for e in events],
+                "source_nodes": [e.source_node for e in events],
+                "merged_at": datetime.now().isoformat(),
+            },
         }
         result.timestamp = datetime.now()
 
@@ -451,6 +468,7 @@ class ConflictResolver:
         logger.debug(
             "conflict_resolver.pncounter_merge",
             merged_value=merged.value(),
+            source_events=len(events),
         )
         return result
 
@@ -485,7 +503,12 @@ class ConflictResolver:
         winner: ReplicationEvent,
         strategy: str,
     ) -> None:
-        """Record a conflict resolution in the audit log."""
+        """Record a conflict resolution in the audit log.
+
+        The deque's ``maxlen`` handles eviction automatically — the oldest
+        record is dropped when the capacity is exceeded, so this method
+        only needs to append.
+        """
         record = ConflictRecord(
             key=winner.key,
             strategy_used=strategy,
@@ -500,11 +523,6 @@ class ConflictResolver:
             },
         )
         self._audit_log.append(record)
-
-        # Trim audit log if necessary
-        if len(self._audit_log) > self._max_audit_records:
-            trim_count = len(self._audit_log) - self._max_audit_records
-            self._audit_log = self._audit_log[trim_count:]
 
         logger.debug(
             "conflict_resolver.recorded",
@@ -543,7 +561,7 @@ class ConflictResolver:
 
         Optionally filter by key.
         """
-        records = self._audit_log
+        records: List[ConflictRecord] = list(self._audit_log)
         if key:
             records = [r for r in records if r.key == key]
         return [r.to_dict() for r in records[-limit:]]

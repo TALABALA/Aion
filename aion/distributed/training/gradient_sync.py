@@ -263,6 +263,8 @@ class GradientSynchronizer:
             payload_size = self._estimate_size(outgoing)
             self._total_bytes_sent += payload_size
 
+            incoming: Optional[Dict[str, Any]] = None
+
             # Send chunk to right neighbour via RPC
             if rpc_client and right_addr:
                 try:
@@ -277,24 +279,23 @@ class GradientSynchronizer:
                     # The response contains the chunk from our left neighbour
                     if resp and "chunk_data" in resp:
                         incoming = resp["chunk_data"]
-                    else:
-                        incoming = outgoing  # Fallback: echo local
                 except Exception:
-                    logger.debug(
+                    logger.warning(
                         "ring_scatter_reduce_rpc_failed",
                         step=step,
                         round=self._round,
                     )
-                    incoming = outgoing
-            else:
-                incoming = outgoing
+                    # incoming stays None — skip accumulation to avoid
+                    # double-counting local data
 
-            if self._config.compression_enabled:
-                incoming = self.decompress(incoming)
+            # Only accumulate if we actually received remote data
+            if incoming is not None:
+                if self._config.compression_enabled:
+                    incoming = self.decompress(incoming)
 
-            for k, v in incoming.items():
-                if k in chunk_data[recv_chunk_idx]:
-                    chunk_data[recv_chunk_idx][k] += self._safe_float(v)
+                for k, v in incoming.items():
+                    if k in chunk_data[recv_chunk_idx]:
+                        chunk_data[recv_chunk_idx][k] += self._safe_float(v)
 
         # Phase 2 - All-gather: N-1 steps
         for step in range(num_nodes - 1):
@@ -318,17 +319,16 @@ class GradientSynchronizer:
                     )
                     if resp and "chunk_data" in resp:
                         chunk_data[recv_chunk_idx] = resp["chunk_data"]
-                    else:
-                        chunk_data[recv_chunk_idx] = outgoing
+                    # If no chunk_data in response, keep existing chunk
+                    # rather than overwriting with local outgoing data
                 except Exception:
-                    logger.debug(
+                    logger.warning(
                         "ring_all_gather_rpc_failed",
                         step=step,
                         round=self._round,
                     )
-                    chunk_data[recv_chunk_idx] = outgoing
-            else:
-                chunk_data[recv_chunk_idx] = outgoing
+                    # Keep existing chunk_data[recv_chunk_idx] unchanged
+                    # to avoid corrupting the reduce result with local echoes
 
         # Reassemble full gradient from chunks and divide by N
         result: Dict[str, Any] = {}

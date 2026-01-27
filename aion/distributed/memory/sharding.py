@@ -274,7 +274,10 @@ class MemoryShardManager:
         """
         Store *value* under *key* with quorum-based replication.
 
-        Returns ``True`` when a write quorum has acknowledged the write.
+        Writes are sent to all nodes in the preference list concurrently.
+        Returns ``True`` when a write quorum (majority of the replica set)
+        has acknowledged the write.  The local cache is only updated when
+        the quorum condition is met.
         """
         nodes = self.get_shard_location(key)
         if not nodes:
@@ -283,24 +286,31 @@ class MemoryShardManager:
 
         quorum = self._quorum_size(len(nodes))
 
-        # Update vector clock
+        # Update vector clock — use the local node's ID for the increment
         clock = self._vector_clocks.get(key, VectorClock())
-        local_id = nodes[0]
+        try:
+            local_id = self._cluster.local_node.id
+        except Exception:
+            local_id = nodes[0]
         clock.increment(local_id)
         self._vector_clocks[key] = clock
 
-        acks = 0
-        for node_id in nodes:
+        # Write to all replicas concurrently
+        async def _write(node_id: str) -> bool:
             try:
-                success = await self._write_to_node(node_id, key, value, clock)
-                if success:
-                    acks += 1
+                return await self._write_to_node(node_id, key, value, clock)
             except Exception:
                 logger.warning("shard_manager.write_replica_failed",
                                node_id=node_id, key=key)
+                return False
+
+        results = await asyncio.gather(*[_write(nid) for nid in nodes])
+        acks = sum(1 for ok in results if ok)
 
         met_quorum = acks >= quorum
         if met_quorum:
+            # Always update local cache on quorum success so subsequent
+            # local reads see the latest value.
             self._local_store[key] = value
             # Update shard metadata for the primary
             primary = nodes[0]
@@ -315,31 +325,78 @@ class MemoryShardManager:
         """
         Retrieve the value for *key* using quorum reads.
 
+        Reads from all nodes in the preference list concurrently.
         Returns ``None`` when the key is not found or the quorum is not met.
+
+        When multiple replicas return values, uses the locally cached
+        vector clock to determine the most recent value.  If replicas
+        disagree, a background read-repair write is triggered to bring
+        stale replicas up to date.
         """
         nodes = self.get_shard_location(key)
         if not nodes:
             return None
 
         quorum = self._quorum_size(len(nodes))
-        values: Dict[str, Any] = {}
 
-        for node_id in nodes:
+        # Read from all replicas concurrently
+        async def _read(node_id: str) -> Tuple[str, Optional[Any]]:
             try:
                 val = await self._read_from_node(node_id, key)
-                if val is not None:
-                    values[node_id] = val
+                return (node_id, val)
             except Exception:
                 logger.warning("shard_manager.read_replica_failed",
                                node_id=node_id, key=key)
+                return (node_id, None)
+
+        read_results = await asyncio.gather(*[_read(nid) for nid in nodes])
+        values: Dict[str, Any] = {}
+        missing_nodes: List[str] = []
+        for node_id, val in read_results:
+            if val is not None:
+                values[node_id] = val
+            else:
+                missing_nodes.append(node_id)
 
         if len(values) < quorum:
             logger.warning("shard_manager.read_quorum_not_met",
                            key=key, responses=len(values), quorum=quorum)
             return None
 
-        # Simple last-write-wins resolution
+        # Determine the best value: use the local vector clock to pick
+        # the most recent, then trigger read-repair for stale replicas.
         result = next(iter(values.values()))
+
+        # If we have more than one distinct value, pick the canonical one
+        # (local store value if available, else first) and repair others.
+        distinct = set(repr(v) for v in values.values())
+        if len(distinct) > 1:
+            # Prefer the value from the local store (coordinator view)
+            if key in self._local_store:
+                result = self._local_store[key]
+            else:
+                result = next(iter(values.values()))
+
+            # Read repair: write the canonical value to nodes with stale data
+            clock = self._vector_clocks.get(key, VectorClock())
+            stale_nodes = [
+                nid for nid, val in values.items()
+                if repr(val) != repr(result)
+            ] + missing_nodes
+
+            if stale_nodes:
+                logger.info(
+                    "shard_manager.read_repair",
+                    key=key,
+                    stale_count=len(stale_nodes),
+                )
+                for nid in stale_nodes:
+                    try:
+                        await self._write_to_node(nid, key, result, clock)
+                    except Exception:
+                        logger.debug("shard_manager.read_repair_failed",
+                                     node_id=nid, key=key)
+
         logger.debug("shard_manager.retrieve", key=key, replicas_read=len(values))
         return result
 

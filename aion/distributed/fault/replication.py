@@ -388,6 +388,10 @@ class DataReplicator:
             lag.last_replicated_at = datetime.now()
             lag.last_checked_at = datetime.now()
 
+            # Invalidate digest cache for this shard so subsequent
+            # anti-entropy checks use fresh data.
+            self.invalidate_digest(data_key, target_node)
+
             logger.debug(
                 "data_replicator.replicated_to_node",
                 data_key=data_key,
@@ -483,6 +487,29 @@ class DataReplicator:
     # Anti-entropy repair via Merkle trees
     # ------------------------------------------------------------------
 
+    def invalidate_digest(
+        self, shard_id: str, node_id: Optional[str] = None
+    ) -> None:
+        """Invalidate cached Merkle digests after a write or replication.
+
+        Must be called whenever data in a shard changes so that the next
+        anti-entropy round uses a fresh digest instead of a stale cache.
+
+        Args:
+            shard_id: The shard whose digest should be evicted.
+            node_id: If provided, only invalidate the digest for this
+                     specific (shard, node) pair.  Otherwise invalidate
+                     all cached digests for the shard.
+        """
+        if node_id is not None:
+            self._merkle_digests.pop((shard_id, node_id), None)
+        else:
+            keys_to_remove = [
+                k for k in self._merkle_digests if k[0] == shard_id
+            ]
+            for k in keys_to_remove:
+                del self._merkle_digests[k]
+
     async def compute_merkle_digest(
         self, shard_id: str, node_id: str
     ) -> MerkleDigest:
@@ -492,14 +519,20 @@ class DataReplicator:
         local node, keys are read directly from the cluster state; for
         remote nodes the RPC client is used to fetch key hashes.
 
-        The digest is cached for ``anti_entropy_interval`` seconds to
-        avoid redundant computation.
+        The digest is cached for a short TTL (10 seconds) to avoid
+        redundant computation within a single anti-entropy sweep while
+        ensuring writes are detected promptly.  Callers should call
+        :meth:`invalidate_digest` after mutations for immediate freshness.
         """
+        # Short TTL for cache validity — much shorter than the anti-entropy
+        # interval to prevent stale comparisons after writes.
+        _DIGEST_CACHE_TTL = 10.0  # seconds
+
         cache_key = (shard_id, node_id)
         cached = self._merkle_digests.get(cache_key)
         if cached is not None:
             age = (datetime.now() - cached.computed_at).total_seconds()
-            if age < self._anti_entropy_interval:
+            if age < _DIGEST_CACHE_TTL:
                 return cached
 
         state = self._cluster_manager.state
@@ -568,11 +601,12 @@ class DataReplicator:
         """Run an anti-entropy repair for a single shard.
 
         Compares the Merkle digest of the primary with each replica.
-        If any replica diverges, its sub-trees are re-synchronised.
+        If any replica diverges, its sub-trees are re-synchronised and
+        then the digest is re-verified to confirm convergence.
 
         Returns:
-            Summary of the repair: how many replicas were checked and
-            how many needed synchronisation.
+            Summary of the repair: how many replicas were checked,
+            how many needed synchronisation, and how many were verified.
         """
         state = self._cluster_manager.state
         shard_registry: Dict[str, ShardInfo] = getattr(state, "shards", {})
@@ -587,6 +621,9 @@ class DataReplicator:
 
         checked = 0
         synced = 0
+        verified = 0
+        verification_failures = 0
+
         for replica_id in shard.replica_nodes:
             checked += 1
             replica_digest = await self.compute_merkle_digest(
@@ -602,13 +639,36 @@ class DataReplicator:
                     diverging_levels=diverging_levels,
                 )
                 # Trigger targeted sync for diverging sub-trees
-                await self.replicate_to_node(shard_id, replica_id)
+                ok = await self.replicate_to_node(shard_id, replica_id)
                 synced += 1
+
+                if ok:
+                    # Post-repair verification: invalidate and re-compute
+                    self.invalidate_digest(shard_id, replica_id)
+                    new_digest = await self.compute_merkle_digest(
+                        shard_id, replica_id
+                    )
+                    if primary_digest.matches(new_digest):
+                        verified += 1
+                        logger.debug(
+                            "data_replicator.repair_verified",
+                            shard_id=shard_id,
+                            replica=replica_id,
+                        )
+                    else:
+                        verification_failures += 1
+                        logger.warning(
+                            "data_replicator.repair_verification_failed",
+                            shard_id=shard_id,
+                            replica=replica_id,
+                        )
 
         result = {
             "shard_id": shard_id,
             "replicas_checked": checked,
             "replicas_synced": synced,
+            "replicas_verified": verified,
+            "verification_failures": verification_failures,
         }
         logger.debug("data_replicator.anti_entropy_complete", **result)
         return result

@@ -979,36 +979,51 @@ class RaftConsensus:
 
         If the peer's next_index has been compacted away (behind the
         snapshot boundary), an InstallSnapshot RPC is sent instead.
-        """
-        next_idx = self._next_index.get(peer_id, 0)
 
-        # If the follower needs entries we've already compacted,
-        # send a snapshot instead (§7 of the Raft paper).
-        snapshot_index = self._replicated_log.snapshot_index
+        All reads and writes to ``_next_index`` and ``_match_index``
+        are protected by ``self._lock`` to prevent races when multiple
+        peers are serviced concurrently via ``asyncio.gather``.
+        """
+        async with self._lock:
+            next_idx = self._next_index.get(peer_id, 0)
+
+            # If the follower needs entries we've already compacted,
+            # send a snapshot instead (§7 of the Raft paper).
+            snapshot_index = self._replicated_log.snapshot_index
+            if snapshot_index >= 0 and next_idx <= snapshot_index:
+                # Release lock before the potentially slow snapshot RPC
+                pass
+            else:
+                snapshot_index = -1  # sentinel: no snapshot needed
+
+            prev_log_index = next_idx - 1
+            prev_log_term = self._replicated_log.get_term_at(prev_log_index)
+
+            # Get entries to send
+            entries = self._replicated_log.get_entries_since(next_idx)
+            if len(entries) > self._max_entries_per_request:
+                entries = entries[: self._max_entries_per_request]
+
+            current_term = self._current_term
+            commit_index = self._commit_index
+
+        # Handle snapshot case (outside lock for the slow RPC)
         if snapshot_index >= 0 and next_idx <= snapshot_index:
             await self._send_install_snapshot_to_peer(peer_id)
             return
 
-        prev_log_index = next_idx - 1
-        prev_log_term = self._replicated_log.get_term_at(prev_log_index)
-
-        # Get entries to send
-        entries = self._replicated_log.get_entries_since(next_idx)
-        if len(entries) > self._max_entries_per_request:
-            entries = entries[: self._max_entries_per_request]
-
         request = AppendEntriesRequest(
-            term=self._current_term,
+            term=current_term,
             leader_id=self._node_info.id,
             prev_log_index=prev_log_index,
             prev_log_term=prev_log_term,
             entries=entries,
-            leader_commit=self._commit_index,
+            leader_commit=commit_index,
         )
 
         self._append_entries_sent += 1
 
-        # Send RPC (via cluster manager's transport)
+        # Send RPC (via cluster manager's transport) — outside lock
         response = await self._send_append_entries_rpc(peer_id, request)
         if response is None:
             self._log.debug(
@@ -1017,57 +1032,59 @@ class RaftConsensus:
             )
             return
 
-        # Handle higher term discovery
-        if self._discover_higher_term(response.term, source=f"ae_response_{peer_id}"):
-            return
+        # Process response under lock
+        async with self._lock:
+            # Handle higher term discovery
+            if self._discover_higher_term(response.term, source=f"ae_response_{peer_id}"):
+                return
 
-        if response.success:
-            # Update next_index and match_index
-            if entries:
-                new_match = entries[-1].index
+            if response.success:
+                # Update next_index and match_index
+                if entries:
+                    new_match = entries[-1].index
+                else:
+                    new_match = prev_log_index
+                self._next_index[peer_id] = new_match + 1
+                self._match_index[peer_id] = new_match
+
+                self._log.debug(
+                    "append_entries_success",
+                    peer=peer_id,
+                    match_index=new_match,
+                    entries_sent=len(entries),
+                )
             else:
-                new_match = prev_log_index
-            self._next_index[peer_id] = new_match + 1
-            self._match_index[peer_id] = new_match
-
-            self._log.debug(
-                "append_entries_success",
-                peer=peer_id,
-                match_index=new_match,
-                entries_sent=len(entries),
-            )
-        else:
-            # Conflict: use optimization to skip back efficiently
-            if response.conflict_term is not None:
-                # Search our log for entries with the conflict term
-                # and set next_index to the end of that term
-                found = False
-                for i in range(
-                    self._replicated_log.get_last_index(),
-                    self._replicated_log.snapshot_index,
-                    -1,
-                ):
-                    entry = self._replicated_log.get(i)
-                    if entry and entry.term == response.conflict_term:
-                        self._next_index[peer_id] = i + 1
-                        found = True
-                        break
-                if not found and response.conflict_index is not None:
+                # Conflict: use optimization to skip back efficiently
+                if response.conflict_term is not None:
+                    # Search our log for entries with the conflict term
+                    # and set next_index to the end of that term
+                    found = False
+                    for i in range(
+                        self._replicated_log.get_last_index(),
+                        self._replicated_log.snapshot_index,
+                        -1,
+                    ):
+                        entry = self._replicated_log.get(i)
+                        if entry and entry.term == response.conflict_term:
+                            self._next_index[peer_id] = i + 1
+                            found = True
+                            break
+                    if not found and response.conflict_index is not None:
+                        self._next_index[peer_id] = response.conflict_index
+                elif response.conflict_index is not None:
+                    # Follower does not have the entry at all
                     self._next_index[peer_id] = response.conflict_index
-            elif response.conflict_index is not None:
-                # Follower does not have the entry at all
-                self._next_index[peer_id] = response.conflict_index
-            else:
-                # Simple decrement fallback
-                self._next_index[peer_id] = max(0, next_idx - 1)
+                else:
+                    # Simple decrement fallback
+                    self._next_index[peer_id] = max(0, next_idx - 1)
 
-            self._log.debug(
-                "append_entries_conflict",
-                peer=peer_id,
-                conflict_term=response.conflict_term,
-                conflict_index=response.conflict_index,
-                new_next_index=self._next_index[peer_id],
-            )
+                self._log.debug(
+                    "append_entries_conflict",
+                    peer=peer_id,
+                    conflict_term=response.conflict_term,
+                    conflict_index=response.conflict_index,
+                    new_next_index=self._next_index[peer_id],
+                )
 
     async def _advance_commit_index(self) -> None:
         """
@@ -1470,13 +1487,14 @@ class RaftConsensus:
         try:
             response = await self._send_install_snapshot_rpc(peer_id, request)
             if response is not None:
-                if self._discover_higher_term(
-                    response.term, source=f"install_snap_resp_{peer_id}"
-                ):
-                    return
-                # On success, advance next_index past the snapshot
-                self._next_index[peer_id] = snapshot_index + 1
-                self._match_index[peer_id] = snapshot_index
+                async with self._lock:
+                    if self._discover_higher_term(
+                        response.term, source=f"install_snap_resp_{peer_id}"
+                    ):
+                        return
+                    # On success, advance next_index past the snapshot
+                    self._next_index[peer_id] = snapshot_index + 1
+                    self._match_index[peer_id] = snapshot_index
                 self._log.info(
                     "install_snapshot_sent",
                     peer=peer_id,
