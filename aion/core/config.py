@@ -325,6 +325,9 @@ class AIONConfig(BaseSettings):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)
 
+    # Distributed computing (optional)
+    distributed_enabled: bool = Field(default=False, description="Enable distributed cluster mode")
+
     # Data paths
     data_dir: Path = Field(default=Path("./data"))
     checkpoints_dir: Path = Field(default=Path("./checkpoints"))
