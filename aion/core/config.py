@@ -327,6 +327,8 @@ class AIONConfig(BaseSettings):
 
     # NLP Programming System - configured via NLProgrammingConfig
     # (imported lazily in kernel to avoid circular deps)
+    # Distributed computing (optional)
+    distributed_enabled: bool = Field(default=False, description="Enable distributed cluster mode")
 
     # Data paths
     data_dir: Path = Field(default=Path("./data"))
