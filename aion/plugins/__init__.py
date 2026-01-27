@@ -6,14 +6,15 @@ plugins to extend functionality with enterprise-level security and reliability.
 
 SOTA Features:
 - Process isolation (subprocess-based sandboxing like VS Code Extension Host)
+- gRPC IPC (high-performance inter-process communication with protobuf/msgpack)
 - Capability-based security (Deno-style permission model)
 - Circuit breaker & bulkhead patterns (fault isolation)
 - Cryptographic code signing (ED25519 verification)
-- OpenTelemetry integration (distributed tracing & metrics)
+- OpenTelemetry SDK integration (real OTel with OTLP/Jaeger/Prometheus export)
 - Hot module replacement with state preservation (Webpack/Vite-style HMR)
+- SAT solver for dependency resolution (npm/pip-style constraint solving)
 - Resource quotas & limits enforcement
 - Full lifecycle management (load/unload/activate/suspend)
-- Dependency resolution with topological ordering
 - Hook system for extensibility points
 - Event emission for monitoring
 - REST API for management
@@ -167,6 +168,12 @@ from aion.plugins.hooks.events import PluginEventEmitter, get_event_emitter
 
 from aion.plugins.dependencies.resolver import DependencyResolver, ResolutionResult
 from aion.plugins.dependencies.graph import DependencyGraph
+from aion.plugins.dependencies.sat_solver import (
+    SATDependencyResolver,
+    DPLLSolver,
+    SolutionSet,
+    resolve_dependencies,
+)
 
 from aion.plugins.sandbox.runtime import SandboxRuntime, SandboxedPlugin, ExecutionResult
 from aion.plugins.sandbox.permissions import (
@@ -193,6 +200,12 @@ from aion.plugins.isolation import (
     ResourceQuota,
     ResourceEnforcer,
     ResourceViolation,
+    # gRPC IPC
+    GRPCConfig,
+    GRPCPluginServer,
+    GRPCPluginClient,
+    GRPCIsolatedPlugin,
+    GRPC_AVAILABLE,
 )
 
 # Resilience (Circuit Breaker, Bulkhead, Retry)
@@ -238,6 +251,13 @@ from aion.plugins.telemetry import (
     Counter,
     Gauge,
     Histogram,
+    # OpenTelemetry SDK Integration
+    OTelManager,
+    OTelConfig,
+    configure_otel,
+    get_tracer,
+    get_meter,
+    OTEL_AVAILABLE,
 )
 
 # Hot Module Replacement
@@ -343,6 +363,12 @@ __all__ = [
     "DependencyGraph",
     "ResolutionResult",
 
+    # === SOTA: SAT-Based Dependency Resolution ===
+    "SATDependencyResolver",
+    "DPLLSolver",
+    "SolutionSet",
+    "resolve_dependencies",
+
     # === Sandbox ===
     "SandboxRuntime",
     "SandboxedPlugin",
@@ -370,6 +396,13 @@ __all__ = [
     "ResourceQuota",
     "ResourceEnforcer",
     "ResourceViolation",
+
+    # === SOTA: gRPC IPC ===
+    "GRPCConfig",
+    "GRPCPluginServer",
+    "GRPCPluginClient",
+    "GRPCIsolatedPlugin",
+    "GRPC_AVAILABLE",
 
     # === SOTA: Resilience ===
     "CircuitBreaker",
@@ -410,6 +443,14 @@ __all__ = [
     "Gauge",
     "Histogram",
 
+    # === SOTA: OpenTelemetry SDK Integration ===
+    "OTelManager",
+    "OTelConfig",
+    "configure_otel",
+    "get_tracer",
+    "get_meter",
+    "OTEL_AVAILABLE",
+
     # === SOTA: Hot Module Replacement ===
     "HotModuleReplacer",
     "HMRConfig",
@@ -420,4 +461,4 @@ __all__ = [
 ]
 
 # Version
-__version__ = "2.0.0"  # Major version bump for SOTA features
+__version__ = "2.1.0"  # Added SAT solver, real OTel SDK, gRPC IPC
