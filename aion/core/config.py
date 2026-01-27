@@ -325,6 +325,8 @@ class AIONConfig(BaseSettings):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)
 
+    # NLP Programming System - configured via NLProgrammingConfig
+    # (imported lazily in kernel to avoid circular deps)
     # Distributed computing (optional)
     distributed_enabled: bool = Field(default=False, description="Enable distributed cluster mode")
 

@@ -99,6 +99,13 @@ try:
 except ImportError:
     LEARNING_AVAILABLE = False
 
+# NLP Programming System imports (conditional to avoid import errors)
+try:
+    from aion.nlp import NLProgrammingEngine, NLProgrammingConfig
+    NLP_AVAILABLE = True
+except ImportError:
+    NLP_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -198,6 +205,9 @@ class AIONKernel:
         self._cluster_manager = None
         # Reinforcement Learning Loop
         self._rl_loop = None
+
+        # NLP Programming System
+        self._nlp_engine = None
 
         # Persistence layer
         self._state_manager = None
@@ -435,6 +445,10 @@ class AIONKernel:
         if LEARNING_AVAILABLE:
             await self._initialize_learning()
 
+        # Initialize NLP Programming System
+        if NLP_AVAILABLE:
+            await self._initialize_nlp()
+
     async def _initialize_conversation(self) -> None:
         """Initialize the Conversation System."""
         try:
@@ -651,6 +665,27 @@ class AIONKernel:
         except Exception as e:
             logger.error(f"Learning system initialization failed: {e}")
             self._update_health("learning", SystemStatus.ERROR, str(e))
+
+    async def _initialize_nlp(self) -> None:
+        """Initialize the NLP Programming System."""
+        try:
+            from aion.nlp import NLProgrammingEngine, NLProgrammingConfig
+
+            nlp_config = NLProgrammingConfig()
+            self._nlp_engine = NLProgrammingEngine(
+                kernel=self,
+                config=nlp_config,
+            )
+            await self._nlp_engine.initialize()
+            self._update_health("nlp_programming", SystemStatus.READY)
+            logger.info("NLP Programming System initialized successfully")
+
+        except ImportError as e:
+            logger.warning(f"NLP Programming System not available: {e}")
+            self._update_health("nlp_programming", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"NLP Programming System initialization failed: {e}")
+            self._update_health("nlp_programming", SystemStatus.ERROR, str(e))
 
     async def _initialize_mcp(self) -> None:
         """Initialize the MCP Integration Layer."""
@@ -939,6 +974,10 @@ class AIONKernel:
         # Shutdown learning loop
         if self._rl_loop:
             await self._rl_loop.shutdown()
+
+        # Shutdown NLP programming system
+        if self._nlp_engine:
+            await self._nlp_engine.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -1563,6 +1602,23 @@ Output a JSON array of steps, each with:
             "available": True,
             **self._cluster_manager.get_cluster_info(),
             **self._rl_loop.get_stats(),
+        }
+
+    # ==================== NLP Programming System Access ====================
+
+    @property
+    def nlp_programming(self):
+        """Get the NLP programming engine."""
+        return self._nlp_engine
+
+    def get_nlp_stats(self) -> dict[str, Any]:
+        """Get NLP programming system statistics."""
+        if not self._nlp_engine:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._nlp_engine.get_stats(),
         }
 
     # ==================== Persistence Layer Access ====================
