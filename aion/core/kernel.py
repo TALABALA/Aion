@@ -85,6 +85,13 @@ try:
 except ImportError:
     PLUGINS_AVAILABLE = False
 
+# Reinforcement Learning Loop imports (conditional to avoid import errors)
+try:
+    from aion.learning import ReinforcementLearningLoop, LearningConfig
+    LEARNING_AVAILABLE = True
+except ImportError:
+    LEARNING_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -179,6 +186,9 @@ class AIONKernel:
 
         # Plugin system
         self._plugin_manager = None
+
+        # Reinforcement Learning Loop
+        self._rl_loop = None
 
         # Persistence layer
         self._state_manager = None
@@ -409,6 +419,10 @@ class AIONKernel:
         if PLUGINS_AVAILABLE:
             await self._initialize_plugins()
 
+        # Initialize Reinforcement Learning Loop
+        if LEARNING_AVAILABLE:
+            await self._initialize_learning()
+
     async def _initialize_conversation(self) -> None:
         """Initialize the Conversation System."""
         try:
@@ -574,6 +588,26 @@ class AIONKernel:
         except Exception as e:
             logger.error(f"Plugin system initialization failed: {e}")
             self._update_health("plugins", SystemStatus.ERROR, str(e))
+
+    async def _initialize_learning(self) -> None:
+        """Initialize the Reinforcement Learning Loop."""
+        try:
+            from aion.learning import ReinforcementLearningLoop, LearningConfig
+
+            self._rl_loop = ReinforcementLearningLoop(
+                kernel=self,
+                config=LearningConfig(),
+            )
+            await self._rl_loop.initialize()
+            self._update_health("learning", SystemStatus.READY)
+            logger.info("Reinforcement Learning Loop initialized successfully")
+
+        except ImportError as e:
+            logger.warning(f"Learning system not available: {e}")
+            self._update_health("learning", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"Learning system initialization failed: {e}")
+            self._update_health("learning", SystemStatus.ERROR, str(e))
 
     async def _initialize_mcp(self) -> None:
         """Initialize the MCP Integration Layer."""
@@ -855,6 +889,10 @@ class AIONKernel:
         # Shutdown plugin system
         if self._plugin_manager:
             await self._plugin_manager.shutdown()
+
+        # Shutdown learning loop
+        if self._rl_loop:
+            await self._rl_loop.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -1442,6 +1480,23 @@ Output a JSON array of steps, each with:
         if not self._plugin_manager:
             return []
         return self._plugin_manager.get_plugin_tools()
+
+    # ==================== Reinforcement Learning Access ====================
+
+    @property
+    def learning(self):
+        """Get the reinforcement learning loop."""
+        return self._rl_loop
+
+    def get_learning_stats(self) -> dict[str, Any]:
+        """Get reinforcement learning loop statistics."""
+        if not self._rl_loop:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._rl_loop.get_stats(),
+        }
 
     # ==================== Persistence Layer Access ====================
 
