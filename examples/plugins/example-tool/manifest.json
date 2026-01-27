@@ -1,0 +1,73 @@
+{
+  "id": "example-tool",
+  "name": "Example Tool Plugin",
+  "version": "1.0.0",
+  "description": "A comprehensive example demonstrating AION plugin development",
+  "type": "tool",
+  "author": {
+    "name": "AION Team",
+    "email": "plugins@aion.ai",
+    "url": "https://aion.ai"
+  },
+  "homepage": "https://github.com/aion/example-tool-plugin",
+  "repository": "https://github.com/aion/example-tool-plugin",
+  "license": "MIT",
+  "entry_point": "plugin:ExampleToolPlugin",
+  "aion_version": ">=1.0.0",
+  "python_version": ">=3.10",
+  "pip_dependencies": [],
+  "dependencies": [],
+  "permissions": {
+    "level": "standard",
+    "network_access": false,
+    "file_system_access": false,
+    "database_access": false,
+    "memory_access": true
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "greeting_prefix": {
+        "type": "string",
+        "description": "Prefix for greeting messages",
+        "default": "Hello"
+      },
+      "enable_logging": {
+        "type": "boolean",
+        "description": "Enable verbose logging",
+        "default": false
+      },
+      "max_retries": {
+        "type": "integer",
+        "description": "Maximum retry attempts",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 3
+      }
+    },
+    "required": []
+  },
+  "default_config": {
+    "greeting_prefix": "Hello",
+    "enable_logging": false,
+    "max_retries": 3
+  },
+  "hooks": [
+    "tool.before_execute",
+    "request.before"
+  ],
+  "features": [
+    "greeting",
+    "calculation",
+    "text-processing"
+  ],
+  "tags": [
+    "example",
+    "demo",
+    "tools",
+    "getting-started"
+  ],
+  "auto_enable": false,
+  "singleton": false,
+  "priority": 50
+}

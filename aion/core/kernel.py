@@ -78,6 +78,13 @@ try:
 except ImportError:
     AUTOMATION_AVAILABLE = False
 
+# Plugin system imports (conditional to avoid import errors)
+try:
+    from aion.plugins import PluginManager, PluginSystemConfig
+    PLUGINS_AVAILABLE = True
+except ImportError:
+    PLUGINS_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 
@@ -169,6 +176,10 @@ class AIONKernel:
         # Automation system
         self._automation_engine = None
         self._trigger_manager = None
+
+        # Plugin system
+        self._plugin_manager = None
+
         # Persistence layer
         self._state_manager = None
         self._backup_manager = None
@@ -394,6 +405,10 @@ class AIONKernel:
         if AUTOMATION_AVAILABLE:
             await self._initialize_automation()
 
+        # Initialize Plugin System
+        if PLUGINS_AVAILABLE:
+            await self._initialize_plugins()
+
     async def _initialize_conversation(self) -> None:
         """Initialize the Conversation System."""
         try:
@@ -507,6 +522,58 @@ class AIONKernel:
         except Exception as e:
             logger.error(f"Automation system initialization failed: {e}")
             self._update_health("automation", SystemStatus.ERROR, str(e))
+
+    async def _initialize_plugins(self) -> None:
+        """Initialize the Plugin System."""
+        try:
+            from aion.plugins import PluginManager, PluginSystemConfig
+
+            # Create plugin system config
+            plugin_config = PluginSystemConfig(
+                plugins_dir=self.config.data_dir / "plugins",
+                enabled=True,
+                auto_discover=True,
+                hot_reload=False,  # Disabled by default for stability
+                sandbox_enabled=True,
+            )
+
+            # Create plugin manager
+            self._plugin_manager = PluginManager(
+                kernel=self,
+                config=plugin_config,
+            )
+
+            await self._plugin_manager.initialize()
+            self._update_health("plugins", SystemStatus.READY)
+
+            # Bridge plugin tools to tool orchestrator if available
+            if self._tool_orchestrator:
+                plugin_tools = self._plugin_manager.get_plugin_tools()
+                for tool in plugin_tools:
+                    try:
+                        await self._tool_orchestrator.register_tool(
+                            name=tool.name,
+                            handler=tool.handler,
+                            description=tool.description,
+                            parameters=tool.parameters,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to register plugin tool: {tool.name}",
+                            error=str(e),
+                        )
+
+            logger.info(
+                "Plugin system initialized successfully",
+                plugins_loaded=len(self._plugin_manager.list_plugins()),
+            )
+
+        except ImportError as e:
+            logger.warning(f"Plugin system not available: {e}")
+            self._update_health("plugins", SystemStatus.DEGRADED, "Not available")
+        except Exception as e:
+            logger.error(f"Plugin system initialization failed: {e}")
+            self._update_health("plugins", SystemStatus.ERROR, str(e))
 
     async def _initialize_mcp(self) -> None:
         """Initialize the MCP Integration Layer."""
@@ -784,6 +851,10 @@ class AIONKernel:
             await self._automation_engine.shutdown()
         if self._trigger_manager:
             await self._trigger_manager.shutdown()
+
+        # Shutdown plugin system
+        if self._plugin_manager:
+            await self._plugin_manager.shutdown()
 
         # Shutdown cognitive subsystems
         if self._llm:
@@ -1302,6 +1373,76 @@ Output a JSON array of steps, each with:
             "available": True,
             **self._automation_engine.get_stats(),
         }
+
+    # ==================== Plugin System Access ====================
+
+    @property
+    def plugins(self):
+        """Get the plugin manager."""
+        return self._plugin_manager
+
+    async def load_plugin(
+        self,
+        plugin_id: str,
+        config: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Convenience method to load and activate a plugin.
+
+        Args:
+            plugin_id: Plugin identifier
+            config: Optional plugin configuration
+
+        Returns:
+            True if successful
+        """
+        if not self._plugin_manager:
+            return False
+
+        try:
+            await self._plugin_manager.load(plugin_id, config=config or {})
+            await self._plugin_manager.activate(plugin_id)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load plugin: {plugin_id}", error=str(e))
+            return False
+
+    async def unload_plugin(self, plugin_id: str) -> bool:
+        """
+        Convenience method to unload a plugin.
+
+        Args:
+            plugin_id: Plugin identifier
+
+        Returns:
+            True if successful
+        """
+        if not self._plugin_manager:
+            return False
+
+        try:
+            await self._plugin_manager.unload(plugin_id)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to unload plugin: {plugin_id}", error=str(e))
+            return False
+
+    def get_plugin_stats(self) -> dict[str, Any]:
+        """Get plugin system statistics."""
+        if not self._plugin_manager:
+            return {"available": False}
+
+        return {
+            "available": True,
+            **self._plugin_manager.get_stats(),
+        }
+
+    def get_plugin_tools(self) -> list:
+        """Get all tools registered by active plugins."""
+        if not self._plugin_manager:
+            return []
+        return self._plugin_manager.get_plugin_tools()
+
     # ==================== Persistence Layer Access ====================
 
     @property
