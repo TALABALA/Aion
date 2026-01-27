@@ -325,6 +325,9 @@ class AIONConfig(BaseSettings):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)
 
+    # NLP Programming System - configured via NLProgrammingConfig
+    # (imported lazily in kernel to avoid circular deps)
+
     # Data paths
     data_dir: Path = Field(default=Path("./data"))
     checkpoints_dir: Path = Field(default=Path("./checkpoints"))
